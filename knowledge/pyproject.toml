@@ -1,0 +1,22 @@
+[project]
+name = "shopkeeper-brain-ai"
+version = "0.1.0"
+requires-python = ">=3.13"
+dependencies = [
+    "grandalf",
+    "langchain-openai",
+    "langgraph",
+    # MinerU 的 all extra 在 Windows 会引入当前不可用的 Linux/CUDA 推理栈。
+    "mineru; sys_platform == 'win32'",
+    "mineru[all]; sys_platform != 'win32'",
+    "minio",
+    "openai-agents",
+    "pymilvus",
+    "pymongo",
+    "pymupdf>=1.28.2",
+    "sentence-transformers",
+]
+
+[tool.uv]
+# 当前开发环境是 Windows x64；限制解析范围可排除 MinerU 的 Linux vLLM/CUDA 分支。
+environments = ["sys_platform == 'win32' and platform_machine == 'AMD64'"]
