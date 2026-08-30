@@ -1,13 +1,13 @@
 [project]
 name = "shopkeeper-brain-ai"
 version = "0.1.0"
-requires-python = ">=3.13"
+requires-python = ">=3.12,<3.13"
 dependencies = [
     "grandalf",
     "langchain-openai",
     "langgraph",
-    # MinerU 的 all extra 在 Windows 会引入当前不可用的 Linux/CUDA 推理栈。
-    "mineru; sys_platform == 'win32'",
+    # Windows 使用 pipeline 执行本地 PDF 解析，避免引入 all extra 的完整 GPU 推理栈。
+    "mineru[pipeline]; sys_platform == 'win32'",
     "mineru[all]; sys_platform != 'win32'",
     "minio",
     "openai-agents",

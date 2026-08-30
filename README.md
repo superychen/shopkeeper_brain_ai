@@ -11,7 +11,10 @@ Set-Location .\\knowledge
 # Windows PowerShell：启用子项目虚拟环境
 .\\.venv\\Scripts\\Activate.ps1
 
-# 新增依赖并同步环境
+# 项目固定使用 Python 3.12；首次创建或重建环境
+uv sync --python 3.12
+
+# 新增依赖并同步现有环境
 uv add <package>
 uv sync
 ```
@@ -21,3 +24,8 @@ uv sync
 
 PDF 导入子流水线位于 `knowledge/processor/import_processor/`：
 `main_graph.py` 目前只列出节点编排、边定义与图谱运行的职责，具体流程逻辑与节点实现待后续确定后开发。
+
+mineru `
+>>   -p ".\processor\import_processor\tmp_dir\万用表的使用.pdf" `                                                                                                                                                                                                                
+>>   -o ".\processor\import_processor\tmp_dir\mineru_output" `                                                                                                                                                                                                                   
+>>   -b pipeline --source=local                                
