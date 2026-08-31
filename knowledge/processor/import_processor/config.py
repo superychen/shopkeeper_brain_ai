@@ -5,11 +5,13 @@
 """
 
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Set, Optional
 import os
 from dotenv import load_dotenv
 
-load_dotenv()
+# 固定读取 knowledge/.env，避免启动目录变化导致配置加载结果不同。
+load_dotenv(Path(__file__).resolve().parents[2] / ".env")
 
 
 @dataclass
@@ -43,6 +45,23 @@ class ImportConfig:
     )
     default_model: str = field(
         default_factory=lambda: os.getenv("MODEL", "")
+    )
+
+    # ==================== DeepSeek 配置 ====================
+    deepseek_api_base: str = field(
+        default_factory=lambda: os.getenv("DEEPSEEK_API_BASE", "")
+    )
+    deepseek_api_key: str = field(
+        default_factory=lambda: os.getenv("DEEPSEEK_API_KEY", "")
+    )
+    deepseek_vlm_model: str = field(
+        default_factory=lambda: os.getenv(
+            "DEEPSEEK_VLM_MODEL",
+            "deepseek-v4-flash-vision-exp",
+        )
+    )
+    deepseek_llm_model: str = field(
+        default_factory=lambda: os.getenv("DEEPSEEK_LLM_MODEL", "")
     )
 
     # ==================== Milvus 配置 ====================
