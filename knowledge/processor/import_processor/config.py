@@ -14,6 +14,14 @@ from dotenv import load_dotenv
 load_dotenv(Path(__file__).resolve().parents[2] / ".env")
 
 
+def _get_env_bool(name: str, default: bool = False) -> bool:
+    """读取布尔环境变量，避免非空字符串 ``false`` 被误判为真。"""
+    raw_value = os.getenv(name)
+    if raw_value is None:
+        return default
+    return raw_value.strip().casefold() in {"1", "true", "yes", "on"}
+
+
 @dataclass
 class ImportConfig:
     """导入流程配置"""
@@ -92,7 +100,9 @@ class ImportConfig:
     minio_bucket: str = field(
         default_factory=lambda: os.getenv("MINIO_BUCKET_NAME", "")
     )
-    minio_secure: bool = False
+    minio_secure: bool = field(
+        default_factory=lambda: _get_env_bool("MINIO_SECURE", False)
+    )
 
     # ==================== 向量配置 ====================
     embedding_dim: int = field(
@@ -108,10 +118,13 @@ class ImportConfig:
         """从环境变量加载配置"""
         return cls()
 
-    # http://192.168.200.130:9000/
-    def get_minio_base_url(self):
+    def get_minio_base_url(self) -> str:
+        """返回可用于拼接对象地址的 MinIO HTTP(S) 基础地址。"""
+        endpoint = self.minio_endpoint.strip().rstrip("/")
+        if endpoint.startswith(("http://", "https://")):
+            return endpoint
         base_protocol = "https://" if self.minio_secure else "http://"
-        return base_protocol + f"{self.minio_endpoint}"
+        return base_protocol + endpoint
 
 
 # ==================== 全局单例 ====================

@@ -2,6 +2,7 @@
 
 import base64
 import logging
+import mimetypes
 import re
 import threading
 import time
@@ -9,8 +10,9 @@ from collections import deque
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
-from urllib.parse import unquote, urlsplit
+from urllib.parse import quote, unquote, urlsplit
 
+from minio import Minio
 from openai import OpenAI
 
 from knowledge.processor.import_processor.base import BaseNode, setup_logging
@@ -19,10 +21,12 @@ from knowledge.processor.import_processor.exceptions import (
     ConfigurationError,
     FileProcessingError,
     ImageProcessingError,
+    MinioError,
     StateFieldError,
 )
 from knowledge.processor.import_processor.state import ImportGraphState
 from knowledge.utils.client.ai_clients import AIClients
+from knowledge.utils.client.storage_clients import StorageClients
 
 
 @dataclass(frozen=True)
@@ -125,7 +129,7 @@ class _ImageScanner:
 
     _heading_pattern = re.compile(r"^\s{0,3}#{1,6}(?:\s+|$)")
     _image_pattern = re.compile(
-        r"!\[[^\]\n]*\]\(\s*(?P<destination>[^)\n]+?)\s*\)"
+        r"!\[(?P<alt>[^\]\n]*)\]\(\s*(?P<destination>[^)\n]+?)\s*\)"
     )
 
     def __init__(self, logger: logging.Logger, node_name: str) -> None:
@@ -620,8 +624,19 @@ class _VLMSummarizer:
 class _ImageUploader:
     """负责上传图片并替换 Markdown 中的本地图片引用。"""
 
-    def __init__(self, logger: logging.Logger) -> None:
+    _object_root = "knowledge"
+    _unsafe_directory_chars = re.compile(r'[<>:"/\\|?*\x00-\x1f]+')
+
+    def __init__(
+        self,
+        logger: logging.Logger,
+        node_name: str,
+        *,
+        client_factory: Callable[[], Minio] | None = None,
+    ) -> None:
         self.logger = logger
+        self.node_name = node_name
+        self._client_factory = client_factory or StorageClients.get_minio
 
     def upload_and_replace(
         self,
@@ -632,8 +647,211 @@ class _ImageUploader:
         minio_bucket: str,
         minio_base_url: str,
     ) -> str:
-        """上传图片，并返回替换图片引用后的 Markdown 内容。"""
-        raise NotImplementedError("_ImageUploader.upload_and_replace 尚未实现")
+        """上传图片，并返回替换图片引用后的 Markdown 内容。
+
+        MinIO 中的对象统一写入 ``knowledge/{文档名}/{图片名}``。只有所有
+        图片都上传成功后才替换内存中的 Markdown，避免失败时返回半更新内容。
+        本方法不写本地 Markdown 文件，文件落盘由后续 Step 5 负责。
+        """
+        if not image_list:
+            self.logger.info("没有有效图片，跳过 MinIO 上传和 Markdown 替换")
+            return md_content
+
+        bucket = self._require_text(minio_bucket, "MINIO_BUCKET_NAME")
+        base_url = self._normalize_base_url(minio_base_url)
+        document_directory = self._normalize_document_directory(document_name)
+
+        try:
+            client = self._client_factory()
+        except (ConfigurationError, MinioError):
+            raise
+        except Exception as exc:
+            self.logger.error(
+                "获取 MinIO 客户端失败: error_type=%s",
+                type(exc).__name__,
+            )
+            raise MinioError(
+                message="获取 MinIO 客户端失败",
+                node_name=self.node_name,
+                cause=exc,
+            ) from exc
+
+        image_urls = self._upload_all(
+            client=client,
+            bucket=bucket,
+            base_url=base_url,
+            document_directory=document_directory,
+            image_list=image_list,
+        )
+        new_md_content = self._replace_in_md(
+            md_content=md_content,
+            image_list=image_list,
+            image_summaries=image_summaries,
+            image_urls=image_urls,
+        )
+        self.logger.info(
+            "MinIO 图片上传和 Markdown 引用替换完成: document=%s, "
+            "image_count=%d",
+            document_directory,
+            len(image_urls),
+        )
+        return new_md_content
+
+    def _upload_all(
+        self,
+        client: Minio,
+        bucket: str,
+        base_url: str,
+        document_directory: str,
+        image_list: list[_ImageInfo],
+    ) -> dict[Path, str]:
+        """逐张上传图片，并返回本地路径到最终地址的映射。
+
+        单张图片失败时把它映射回本地绝对路径并继续循环。该本地路径用作
+        上传失败标记，后续替换阶段据此保留 Markdown 中原始的相对引用。
+        """
+        image_urls: dict[Path, str] = {}
+        for image in image_list:
+            if not image.path.is_file():
+                self.logger.warning(
+                    "待上传图片不存在，保留本地引用: image_name=%s, path=%s",
+                    image.name,
+                    image.path,
+                )
+                image_urls[image.path] = str(image.path)
+                continue
+
+            object_name = (
+                f"{self._object_root}/{document_directory}/{image.name}"
+            )
+            content_type = (
+                mimetypes.guess_type(image.name)[0]
+                or "application/octet-stream"
+            )
+            try:
+                # fput_object 使用文件流上传，避免把大图片一次性读入内存。
+                client.fput_object(
+                    bucket_name=bucket,
+                    object_name=object_name,
+                    file_path=str(image.path),
+                    content_type=content_type,
+                )
+            except Exception as exc:
+                self.logger.warning(
+                    "MinIO 图片上传失败，保留本地引用并继续: "
+                    "image_name=%s, object_name=%s, error_type=%s",
+                    image.name,
+                    object_name,
+                    type(exc).__name__,
+                )
+                image_urls[image.path] = str(image.path)
+                continue
+
+            object_url = (
+                f"{base_url}/{quote(bucket, safe='')}/"
+                f"{quote(object_name, safe='/')}"
+            )
+            image_urls[image.path] = object_url
+            self.logger.info(
+                "MinIO 图片上传完成: image_name=%s, object_name=%s",
+                image.name,
+                object_name,
+            )
+
+        uploaded_count = sum(
+            self._is_remote_url(image_url)
+            for image_url in image_urls.values()
+        )
+        self.logger.info(
+            "MinIO 图片批量上传结束: total=%d, success=%d, fallback=%d",
+            len(image_list),
+            uploaded_count,
+            len(image_list) - uploaded_count,
+        )
+        return image_urls
+
+    def _replace_in_md(
+        self,
+        md_content: str,
+        image_list: list[_ImageInfo],
+        image_summaries: dict[Path, str],
+        image_urls: dict[Path, str],
+    ) -> str:
+        """把已上传图片的 alt 和本地路径替换为摘要及 MinIO 地址。"""
+        images_by_name = {image.name.casefold(): image for image in image_list}
+
+        def replace_image(match: re.Match[str]) -> str:
+            destination = _ImageScanner._extract_destination(
+                match.group("destination")
+            )
+            if destination is None:
+                return match.group(0)
+
+            parsed_destination = urlsplit(destination)
+            if parsed_destination.scheme.casefold() in {"http", "https", "data"}:
+                return match.group(0)
+
+            image_name = PurePosixPath(
+                unquote(parsed_destination.path).replace("\\", "/")
+            ).name
+            image = images_by_name.get(image_name.casefold())
+            if image is None or image.path not in image_urls:
+                return match.group(0)
+
+            image_url = image_urls[image.path]
+            if not self._is_remote_url(image_url):
+                # 上传失败映射的是本地绝对路径；保留原表达式可避免破坏相对路径。
+                return match.group(0)
+
+            summary = image_summaries.get(image.path) or match.group("alt")
+            normalized_summary = self._normalize_alt(summary)
+            return f"![{normalized_summary}]({image_url})"
+
+        return _ImageScanner._image_pattern.sub(replace_image, md_content)
+
+    def _normalize_document_directory(self, document_name: str) -> str:
+        """生成安全且稳定的文档目录名，同时保留可读的中文名称。"""
+        raw_name = self._require_text(document_name, "document_name")
+        # 调用方通常传入 md_path.stem；再次去除路径是为了防止误传完整路径。
+        leaf_name = PurePosixPath(raw_name.replace("\\", "/")).name
+        directory = self._unsafe_directory_chars.sub("_", leaf_name).strip(" ._")
+        if not directory:
+            raise ImageProcessingError(
+                message="文档名无法生成有效的 MinIO 对象目录",
+                node_name=self.node_name,
+            )
+        return directory
+
+    def _normalize_base_url(self, base_url: str) -> str:
+        """校验并规范化用于返回对象地址的 MinIO 基础 URL。"""
+        normalized = self._require_text(base_url, "MINIO_ENDPOINT").rstrip("/")
+        parsed = urlsplit(normalized)
+        if parsed.scheme.casefold() not in {"http", "https"} or not parsed.netloc:
+            raise ConfigurationError(
+                message="MinIO 基础地址必须是有效的 HTTP(S) URL",
+                node_name=self.node_name,
+            )
+        return normalized
+
+    def _require_text(self, value: str, field_name: str) -> str:
+        """校验 Step 4 必需的非空文本参数。"""
+        if not isinstance(value, str) or not value.strip():
+            raise ConfigurationError(
+                message=f"缺少必需配置或参数: {field_name}",
+                node_name=self.node_name,
+            )
+        return value.strip()
+
+    @staticmethod
+    def _is_remote_url(image_url: str) -> bool:
+        """判断映射值是否为上传成功后生成的 HTTP(S) 对象地址。"""
+        return urlsplit(image_url).scheme.casefold() in {"http", "https"}
+
+    @staticmethod
+    def _normalize_alt(summary: str) -> str:
+        """将摘要转换成不会破坏 Markdown 图片语法的单行 alt 文本。"""
+        normalized = " ".join(summary.split()).replace("[", "").replace("]", "")
+        return normalized or "图片描述"
 
 
 class MdToImgNode(BaseNode):
@@ -647,7 +865,7 @@ class MdToImgNode(BaseNode):
         self._file_handler = _MdFileHandler(self.logger, self.name)
         self._image_scanner = _ImageScanner(self.logger, self.name)
         self._vlm_summarizer = _VLMSummarizer(self.logger, self.name)
-        self._image_uploader = _ImageUploader(self.logger)
+        self._image_uploader = _ImageUploader(self.logger, self.name)
 
     def process(self, state: ImportGraphState) -> ImportGraphState:
         """依次调用文件、扫描、摘要和上传组件处理 Markdown 图片。"""
@@ -680,13 +898,8 @@ class MdToImgNode(BaseNode):
             minio_base_url=self.config.get_minio_base_url(),
         )
 
-        self.log_step("step_5", "备份处理后的 Markdown 内容")
-        new_md_path = self._file_handler.backup(md_path, new_md_content)
-
+        # TODO: Step 5 的本地 Markdown 更新/备份策略待业务规则明确后实现。
         state["md_content"] = new_md_content
-        state["md_path"] = str(new_md_path)
-
-
         return state
 
 
