@@ -120,8 +120,54 @@ class _MdFileHandler:
         return md_content, md_path, image_dir
 
     def backup(self, md_path: Path, new_md_content: str) -> Path:
-        """备份处理后的 Markdown 内容，并返回新文件路径。"""
-        raise NotImplementedError("_MdFileHandler.backup 尚未实现")
+        """将处理后的内容写入同目录的新 Markdown，并返回新文件路径。
+
+        原文件始终保持不变。普通文件名追加 ``_new``；如果输入文件已经以
+        ``_new`` 结尾，则复用该名称，避免重复执行时不断叠加后缀。
+        """
+        if not isinstance(new_md_content, str):
+            raise StateFieldError(
+                node_name=self.node_name,
+                field_name="md_content",
+                expected_type=str,
+            )
+
+        output_stem = (
+            md_path.stem
+            if md_path.stem.casefold().endswith("_new")
+            else f"{md_path.stem}_new"
+        )
+        new_md_path = md_path.with_name(f"{output_stem}{md_path.suffix}")
+
+        try:
+            # 明确使用 open 写入，newline="" 可保留内存内容中的换行形式。
+            with new_md_path.open(
+                mode="w",
+                encoding="utf-8",
+                newline="",
+            ) as md_file:
+                md_file.write(new_md_content)
+        except (OSError, UnicodeError) as exc:
+            self.logger.error(
+                "写入新 Markdown 文件失败: md_path=%s, error_type=%s",
+                new_md_path,
+                type(exc).__name__,
+            )
+            raise FileProcessingError(
+                message=f"写入新 Markdown 文件失败: {new_md_path}",
+                node_name=self.node_name,
+                cause=exc,
+            ) from exc
+
+        new_md_path = new_md_path.resolve()
+        self.logger.info(
+            "处理后的 Markdown 文件写入完成: source_path=%s, "
+            "new_path=%s, content_length=%d",
+            md_path,
+            new_md_path,
+            len(new_md_content),
+        )
+        return new_md_path
 
 
 class _ImageScanner:
@@ -777,20 +823,92 @@ class _ImageUploader:
         image_summaries: dict[Path, str],
         image_urls: dict[Path, str],
     ) -> str:
-        """把已上传图片的 alt 和本地路径替换为摘要及 MinIO 地址。"""
+        """把上传成功图片的 alt 和本地路径替换为摘要及 MinIO 地址。
+
+        ``_image_pattern.sub(replace_image, md_content)`` 会扫描全文。每匹配
+        到一条 ``![alt](destination)``，就把匹配结果交给内部函数
+        ``replace_image``；该函数返回的新字符串会替换原表达式，返回
+        ``match.group(0)`` 则表示保留原文。
+
+        替换流程：
+
+        ```text
+        image_list
+            │
+            ▼
+        按不区分大小写的文件名建立 images_by_name
+        {"a.png": ImageInfo(...), ...}
+            │
+            ▼
+        正则逐个匹配 Markdown 图片：![原 alt](images/a.png)
+            │
+            ▼
+        提取 destination，并判断是否需要处理
+            │
+            ├── 路径无效 ──────────────────────────────> 保留原表达式
+            ├── 已是 http / https / data 地址 ─────────> 保留原表达式
+            │
+            ▼
+        对路径做 URL 解码、统一斜杠，只取文件名 a.png
+            │
+            ▼
+        根据文件名查找对应 ImageInfo
+            │
+            ├── 未找到图片信息或上传结果 ──────────────> 保留原表达式
+            │
+            ▼
+        从 image_urls 取得该图片的最终地址
+            │
+            ├── 不是 HTTP(S) 地址（上传失败的本地路径）> 保留原表达式
+            │
+            ▼
+        从 image_summaries 取得 VLM 摘要
+            │
+            ├── 没有摘要 ───────────────> 使用原 alt
+            │
+            ▼
+        清理摘要中的换行和方括号
+            │
+            ▼
+        生成 ![摘要](MinIO URL)，替换原图片表达式
+        ```
+
+        例如：
+
+        ``![万用表](images/a.png)``
+
+        在摘要为“数字万用表正面按键及接口布局”、上传地址为
+        ``http://127.0.0.1:9000/knowledge-base/knowledge/doc/a.png`` 时，
+        最终替换为：
+
+        ``![数字万用表正面按键及接口布局](http://127.0.0.1:9000/knowledge-base/knowledge/doc/a.png)``
+
+        Args:
+            md_content: 等待处理的完整 Markdown 文本。
+            image_list: Step 2 扫描得到的图片及上下文信息。
+            image_summaries: 本地绝对路径到 VLM 摘要的映射。
+            image_urls: 本地绝对路径到 MinIO 地址或失败降级路径的映射。
+
+        Returns:
+            仅替换上传成功图片引用后的新 Markdown 文本，不修改本地文件。
+        """
+        # Markdown 引用中只有文件名，先建立文件名索引以快速定位 ImageInfo。
         images_by_name = {image.name.casefold(): image for image in image_list}
 
         def replace_image(match: re.Match[str]) -> str:
+            """处理单个正则匹配；不满足替换条件时原样返回。"""
             destination = _ImageScanner._extract_destination(
                 match.group("destination")
             )
             if destination is None:
                 return match.group(0)
 
+            # 远程图片和内嵌 Data URL 不属于本地转换图片，不能重复上传或改写。
             parsed_destination = urlsplit(destination)
             if parsed_destination.scheme.casefold() in {"http", "https", "data"}:
                 return match.group(0)
 
+            # 同时兼容 URL 编码路径、Windows 反斜杠和普通 POSIX 路径。
             image_name = PurePosixPath(
                 unquote(parsed_destination.path).replace("\\", "/")
             ).name
@@ -807,6 +925,7 @@ class _ImageUploader:
             normalized_summary = self._normalize_alt(summary)
             return f"![{normalized_summary}]({image_url})"
 
+        # re.sub 支持回调函数：每个匹配项都由 replace_image 动态决定替换结果。
         return _ImageScanner._image_pattern.sub(replace_image, md_content)
 
     def _normalize_document_directory(self, document_name: str) -> str:
@@ -898,14 +1017,16 @@ class MdToImgNode(BaseNode):
             minio_base_url=self.config.get_minio_base_url(),
         )
 
-        # TODO: Step 5 的本地 Markdown 更新/备份策略待业务规则明确后实现。
+        self.log_step("step_5", "创建处理后的 Markdown 文件")
+        new_md_path = self._file_handler.backup(md_path, new_md_content)
+
         state["md_content"] = new_md_content
+        state["md_path"] = str(new_md_path)
         return state
 
 
 def main() -> None:
-    """使用万用表 PDF 验证 MinerU 转换、图片扫描和 VLM 摘要。"""
-    # 示例只运行到 Step 3，避免调用尚未实现的上传与 Markdown 备份逻辑。
+    """使用万用表 PDF 验证 PDF 转换及 Markdown 图片处理完整流程。"""
     from knowledge.processor.import_processor.nodes.pdf_to_md_node import (
         PdfToMdNode,
     )
@@ -918,55 +1039,42 @@ def main() -> None:
         / "tmp_dir"
         / "万用表的使用.pdf"
     )
+    if not sample_pdf.is_file():
+        raise FileNotFoundError(f"完整流程示例 PDF 不存在: {sample_pdf}")
 
-    logger.info("开始执行 VLM 图片摘要示例: pdf_path=%s", sample_pdf)
+    logger.info("开始执行 Markdown 图片处理完整流程: pdf_path=%s", sample_pdf)
     state: ImportGraphState = {"import_file_path": str(sample_pdf)}
-    expected_md_path = (
-        sample_pdf.parent
-        / sample_pdf.stem
-        / "auto"
-        / f"{sample_pdf.stem}.md"
-    )
-    if (
-        expected_md_path.is_file()
-        and expected_md_path.stat().st_mtime >= sample_pdf.stat().st_mtime
-    ):
-        # PDF 未变化时复用 MinerU 结果，方便单独反复验证 VLM 调用。
-        state["md_path"] = str(expected_md_path.resolve())
-        logger.info("复用已有 MinerU Markdown: md_path=%s", expected_md_path)
-    else:
-        state = PdfToMdNode(config=config)(state)
 
-    node = MdToImgNode(config=config)
-    md_content, md_path, image_dir = node._file_handler.read_md(state)
-    image_list = node._image_scanner.scan_img_dir(
-        image_dir=image_dir,
-        md_content=md_content,
-        image_extensions=config.image_extensions,
-        context_length=config.img_content_length,
-    )
-    if not image_list:
-        logger.warning("示例 Markdown 中没有可供 VLM 识别的本地图片")
-        return
+    # main 仅负责编排节点；每个节点内部继续维护自己的业务步骤与日志。
+    state = PdfToMdNode(config=config).process(state)
+    state = MdToImgNode(config=config).process(state)
 
-    summaries = node._vlm_summarizer.summarize_all(
-        document_title=md_path.stem,
-        image_list=image_list,
-        vl_model=config.deepseek_vlm_model,
-        requests_per_minute=config.requests_per_minute,
-    )
-    successful_count = sum(
-        summary != node._vlm_summarizer._fallback_summary
-        for summary in summaries.values()
+    new_md_path = Path(state["md_path"])
+    new_md_content = state["md_content"]
+    if not new_md_path.is_file():
+        raise RuntimeError(f"完整流程未生成新 Markdown: {new_md_path}")
+    with new_md_path.open(mode="r", encoding="utf-8") as md_file:
+        written_content = md_file.read()
+    if written_content != new_md_content:
+        raise RuntimeError("新 Markdown 文件内容与 state['md_content'] 不一致")
+
+    remote_image_count = sum(
+        1
+        for match in _ImageScanner._image_pattern.finditer(new_md_content)
+        if (
+            destination := _ImageScanner._extract_destination(
+                match.group("destination")
+            )
+        )
+        and urlsplit(destination).scheme.casefold() in {"http", "https"}
     )
     logger.info(
-        "VLM 图片摘要示例完成: total=%d, success=%d, fallback=%d",
-        len(summaries),
-        successful_count,
-        len(summaries) - successful_count,
+        "Markdown 图片处理完整流程执行成功: new_md_path=%s, "
+        "content_length=%d, remote_image_count=%d",
+        new_md_path,
+        len(new_md_content),
+        remote_image_count,
     )
-    if successful_count == 0:
-        raise RuntimeError("VLM 未生成有效图片摘要，请检查模型配置和接口日志")
 
 
 if __name__ == "__main__":
