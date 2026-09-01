@@ -73,6 +73,10 @@ class BaseNode(ABC):
             self.logger.info(f"--- {self.name} 完成 ---")
 
             return result
+        except ImportProcessError as e:
+            # 已分类的业务异常保留原类型，方便 LangGraph 上层按错误类别处理。
+            self.logger.error(f"{self.name} 执行失败: {e}")
+            raise
         except Exception as e:
             self.logger.error(f"{self.name} 执行失败: {e}")
             raise ImportProcessError(
