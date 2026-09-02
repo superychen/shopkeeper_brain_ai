@@ -1,6 +1,6 @@
 # RAG 文档切分节点技术设计
 
-> 文档状态：实施中（Step 1/2 已完成）<br>
+> 文档状态：实施中（Step 1-4 已完成，Step 5 待开发）<br>
 > 适用项目：`shopkeeper_brain_ai/knowledge`<br>
 > 目标节点：`DocumentSplitNode` / `document_split_node`<br>
 > 上游节点：`MdToImgNode` / `md_to_img_node`<br>
@@ -55,9 +55,9 @@ chunk 的 `content` 生成向量，`MilvusSaveNode` 再将 chunk、元数据和�
   `DocumentSplitError`；
 - `BaseNode` 的统一调用、日志和异常处理框架。
 
-项目已新增 `document_split_node.py`，完成 Step 1 输入校验、Step 2 标题切分及对应
-单元测试。Step 3-5 尚未实现，因此 `main_graph.py` 暂不将半成品节点接到
-`md_to_img_node` 之后。
+项目已新增 `document_split_node.py`，完成 Step 1 输入校验、Step 2 标题切分、
+Step 3 长切分/短合并和 Step 4 `ChunkRecord` 组装，并通过对应场景测试。Step 5 的
+统计备份尚未实现，因此 `main_graph.py` 仍暂不把该节点接到 `md_to_img_node` 之后。
 
 ### 2.3 关键决策
 
@@ -112,8 +112,8 @@ flowchart LR
     MILVUS --> END((END))
 ```
 
-当前迭代只实现并接入 `document_split_node`。在 Embedding 和 Milvus 节点尚未实现时，
-可暂时使用 `document_split_node → END`；两个下游节点完成后再替换为完整链路。
+当前迭代实现 `document_split_node`。Step 5 完成后，在 Embedding 和 Milvus 节点尚未
+实现时可暂时使用 `document_split_node → END`；两个下游节点完成后再替换为完整链路。
 
 ### 4.2 节点内部五步流程
 
@@ -284,13 +284,14 @@ heading_pattern = re.compile(r"^ {0,3}(#{1,6})[ \t]+(.+?)\s*$")
 
 #### 6.3.1 超长 section 二次切分
 
-建议方法：
+已实现方法：
 
 ```python
-def _split_long_sections(
+def _split_long_section(
     self,
-    sections: list[Section],
-    max_length: int,
+    section: DocumentSection,
+    *,
+    max_content_length: int,
     overlap_sentences: int,
 ) -> list[ChunkDraft]:
     ...
@@ -307,23 +308,33 @@ def _split_long_sections(
 3. 中文和英文句末标点；
 4. 对仍然超长的纯文本执行定长切分。
 
-代码围栏、Markdown 图片、链接和表格行应作为原子结构优先保留。单个原子结构超过
+代码围栏和独占一行的 Markdown 图片/链接作为原子结构优先保留。标准 Markdown 管道
+表格和 MinerU HTML 表格统一通过独立 `MarkdownTableUtil` 采用“方案三：降维转译法”：
+HTML 先把 `rowspan`/`colspan` 物理投影为二维矩阵，管道表格直接解析成矩阵；随后嗅探
+标准表头表、交叉表或 K-V 表，最后生成每行自带列头/行头的自然语言。这样表格在后续
+再次切分时仍保有完整语义。
+单个原子结构超过
 最大长度且无法安全拆分时，允许它独立成为超限 chunk，并记录包含类型、实际长度和
 section 序号的 warning；不得静默截断或生成语法损坏的 Markdown。
+
+`MarkdownTableUtil` 的模块说明同时保留四种方案的设计：方案一表格隔离、方案二表头
+续传、方案三降维转译、方案四 VLM 视觉解析。目前只有方案三存在运行实现，其余方案
+明确标记为“仅设计、未实现”，后续增加动态路由时无需修改 `DocumentSplitNode`。
 
 `overlap_sentences` 只对句子级切分生效。下一个片段最多携带上一个片段末尾指定数量
 的完整句子，并在加入重叠内容后重新检查最大长度。段落恰好落在边界时不人为制造重复。
 
 #### 6.3.2 过短 chunk 贪心合并
 
-建议方法：
+已实现方法：
 
 ```python
-def _merge_short_chunks(
+def _merge_short_drafts(
     self,
     drafts: list[ChunkDraft],
-    min_length: int,
-    max_length: int,
+    *,
+    min_content_length: int,
+    max_content_length: int,
 ) -> list[ChunkDraft]:
     ...
 ```
@@ -341,7 +352,7 @@ def _merge_short_chunks(
 
 ### 6.4 Step 4：组装切片
 
-建议方法：
+已实现方法：
 
 ```python
 def _assemble_chunks(
@@ -360,7 +371,10 @@ def _assemble_chunks(
 3. 标题或正文为空时不产生多余分隔符；
 4. 仅清理每个组成部分首尾的空行，不改变内部换行；
 5. 生成连续的 `chunk_index`、`char_count` 和来源元数据；
-6. 在完整列表组装、统计和备份均成功后，最后一次性写入 `state["chunks"]`。
+6. 多 section 合并时，`heading_path` 取各 part 的最长公共标题前缀；例如两个
+   同属 `# 安装` 的 H2 合并后，公共路径为 `["# 安装"]`；
+7. 当前 Step 4 在完整列表组装成功后一次性写入 `state["chunks"]`；Step 5 接入后，
+   将进一步调整为备份成功后再写入。
 
 最后写 state 可以避免处理中途失败时留下“看似已完成”的部分 chunks。输出顺序必须完全
 由原文顺序决定，相同输入和配置应得到相同的 chunk 内容与索引。
@@ -449,15 +463,11 @@ class DocumentSplitNode(BaseNode):
     def process(self, state: ImportGraphState) -> ImportGraphState:
         inputs = self._validate_state(state)
         sections = self._split_by_headings(inputs.md_content, inputs.file_title)
-        drafts = self._split_long_sections(
+        drafts = self._split_and_merge(
             sections,
-            inputs.max_content_length,
-            inputs.overlap_sentences,
-        )
-        drafts = self._merge_short_chunks(
-            drafts,
-            inputs.min_content_length,
-            inputs.max_content_length,
+            max_content_length=inputs.max_content_length,
+            min_content_length=inputs.min_content_length,
+            overlap_sentences=inputs.overlap_sentences,
         )
         chunks = self._assemble_chunks(
             drafts,
@@ -634,7 +644,7 @@ Embedding/Milvus 技术设计中补充，不能用本机绝对路径作为跨环
 1. 在 `state.py` 增加 `ChunkRecord` 和可选的 `chunks_backup_path`；
 2. 修正 `BaseNode` 对已有 `ImportProcessError` 的透传；
 3. 实现 Step 1 和 Step 2，并完成标题/围栏测试；
-4. 实现 Step 3，并完成所有长度边界和合并测试；
-5. 实现 Step 4、Step 5 及 JSON 原子写入测试；
+4. ~~实现 Step 3，并完成所有长度边界和合并测试；~~（已完成）
+5. Step 4 已完成；继续实现 Step 5 及 JSON 原子写入测试；
 6. 将节点接入 `main_graph.py`，完成 PDF/Markdown 双路径集成测试；
 7. 单独设计并实现 Embedding 和 Milvus 入库节点。

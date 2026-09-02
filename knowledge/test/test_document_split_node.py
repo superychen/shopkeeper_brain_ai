@@ -6,10 +6,16 @@ from pathlib import Path
 from knowledge.processor.import_processor.config import ImportConfig
 from knowledge.processor.import_processor.exceptions import (
     ConfigurationError,
+    DocumentSplitError,
     StateFieldError,
 )
 from knowledge.processor.import_processor.nodes.document_split_node import (
+    ChunkDraft,
+    DocumentSection,
     DocumentSplitNode,
+)
+from knowledge.processor.import_processor.utils.markdown_table_util import (
+    MarkdownTableUtil,
 )
 
 
@@ -43,6 +49,25 @@ class DocumentSplitNodeTest(unittest.TestCase):
         }
         state.update(overrides)
         return state
+
+    @staticmethod
+    def _section(
+        title: str,
+        body: str,
+        index: int,
+        *,
+        path: tuple[str, ...] | None = None,
+    ) -> DocumentSection:
+        """构造 Step 3 测试 section，减少与测试意图无关的样板字段。"""
+        heading_path = path or (title,)
+        return DocumentSection(
+            title=title,
+            heading_level=len(title) - len(title.lstrip("#")),
+            parent_title=heading_path[-2] if len(heading_path) > 1 else title,
+            heading_path=heading_path,
+            body=body,
+            source_section_index=index,
+        )
 
     def test_validate_state_normalizes_input_and_derives_metadata(self) -> None:
         state = self._state("\ufeff第一行\r\n第二行\r第三行")
@@ -242,13 +267,183 @@ class DocumentSplitNodeTest(unittest.TestCase):
         self.assertEqual([section.source_section_index for section in sections], [0, 1])
         self.assertEqual(self.node._split_by_headings(" \n\n  ", "文件标题"), [])
 
-    def test_process_does_not_publish_intermediate_sections_as_chunks(self) -> None:
+    def test_process_publishes_final_chunks_and_replaces_stale_value(self) -> None:
         state = self._state("# 标题\n正文", chunks=["existing-result"])
 
         result = self.node.process(state)
 
         self.assertIs(result, state)
-        self.assertEqual(result["chunks"], ["existing-result"])
+        self.assertEqual(len(result["chunks"]), 1)
+        self.assertEqual(result["chunks"][0]["content"], "# 标题\n\n正文")
+        self.assertEqual(result["chunks"][0]["char_count"], len("# 标题\n\n正文"))
+        self.assertEqual(result["chunks"][0]["source_section_indexes"], [0])
+
+    def test_process_empty_document_publishes_empty_chunks(self) -> None:
+        state = self._state("", chunks=["stale"])
+
+        result = self.node.process(state)
+
+        self.assertEqual(result["chunks"], [])
+
+    def test_long_section_uses_title_budget_and_respects_max_length(self) -> None:
+        node = self._make_node(max_length=60, min_length=10, overlap=0)
+        markdown = "# 参数\n" + "第一句说明。第二句说明。第三句说明。" * 8
+
+        chunks = node.process(self._state(markdown))["chunks"]
+
+        self.assertGreater(len(chunks), 1)
+        self.assertTrue(all(chunk["content"].startswith("# 参数\n\n") for chunk in chunks))
+        self.assertTrue(all(chunk["char_count"] <= 60 for chunk in chunks))
+        self.assertTrue(all(chunk["source_section_indexes"] == [0] for chunk in chunks))
+
+    def test_title_that_consumes_max_length_raises_clear_error(self) -> None:
+        node = self._make_node(max_length=20, min_length=5, overlap=0)
+        markdown = f"# {'长' * 20}\n正文"
+
+        with self.assertRaises(DocumentSplitError):
+            node.process(self._state(markdown))
+
+    def test_sentence_overlap_is_best_effort_and_never_exceeds_budget(self) -> None:
+        node = self._make_node(max_length=100, min_length=10, overlap=1)
+
+        result = node._apply_sentence_overlap(
+            ["先断电。再开盖。", "取出电池。", "重新装好。"],
+            body_budget=14,
+            overlap_sentences=1,
+        )
+
+        self.assertEqual(result[1], "再开盖。\n取出电池。")
+        self.assertEqual(result[2], "取出电池。\n重新装好。")
+        self.assertTrue(all(len(part) <= 14 for part in result))
+
+    def test_fenced_code_is_not_split_in_the_middle(self) -> None:
+        node = self._make_node(max_length=70, min_length=10, overlap=0)
+        code = "```python\nvalue = 1\n# 代码里的标题\nprint(value)\n```"
+        markdown = f"# 示例\n{'前置说明。' * 10}\n\n{code}\n\n{'后续说明。' * 10}"
+
+        chunks = node.process(self._state(markdown))["chunks"]
+
+        chunks_with_code = [chunk for chunk in chunks if "```python" in chunk["content"]]
+        self.assertEqual(len(chunks_with_code), 1)
+        self.assertIn(code, chunks_with_code[0]["content"])
+        self.assertEqual(sum(chunk["content"].count("```") for chunk in chunks), 2)
+
+    def test_standalone_image_and_link_are_detected_as_atomic_blocks(self) -> None:
+        blocks = self.node._partition_markdown_blocks(
+            "普通说明\n\n![接线图](images/wiring.png)\n[完整手册](manual.pdf)"
+        )
+
+        self.assertEqual([block.kind for block in blocks], ["text", "image", "link"])
+        self.assertEqual([block.atomic for block in blocks], [False, True, True])
+
+    def test_oversized_atomic_block_is_preserved_with_warning(self) -> None:
+        node = self._make_node(max_length=45, min_length=10, overlap=0)
+        code = "```text\n" + ("x" * 70) + "\n```"
+
+        with self.assertLogs(node.logger, level="WARNING") as captured:
+            chunks = node.process(self._state(f"# 示例\n{code}"))["chunks"]
+
+        self.assertIn(code, chunks[0]["content"])
+        self.assertGreater(chunks[0]["char_count"], 45)
+        self.assertTrue(any("原子块超过正文预算" in line for line in captured.output))
+
+    def test_html_table_linearizer_repeats_rowspan_context(self) -> None:
+        html_table = (
+            '<table><tr><th>型号</th><th>量程</th></tr>'
+            '<tr><td rowspan="2">A1</td><td>20V</td></tr>'
+            '<tr><td>200V</td></tr></table>'
+        )
+
+        result = MarkdownTableUtil.process(html_table)
+
+        self.assertEqual(
+            result,
+            "【表格转译】\n- 【型号:A1，量程:20V】\n"
+            "- 【型号:A1，量程:200V】\n"
+            "【表格转译结束】",
+        )
+
+    def test_long_html_table_is_linearized_before_splitting(self) -> None:
+        node = self._make_node(max_length=55, min_length=10, overlap=0)
+        rows = "".join(f"<tr><td>A{i}</td><td>{i * 20}V</td></tr>" for i in range(8))
+        markdown = f"# 参数\n<table>{rows}</table>"
+
+        chunks = node.process(self._state(markdown))["chunks"]
+        full_content = "\n".join(chunk["content"] for chunk in chunks)
+
+        self.assertNotIn("<table>", full_content)
+        self.assertIn("【表格转译】", full_content)
+        self.assertIn("- A7：140V", full_content)
+
+    def test_short_draft_merges_forward_within_same_top_level_branch(self) -> None:
+        node = self._make_node(max_length=100, min_length=45, overlap=0)
+        sections = [
+            self._section("## 准备", "短介绍", 0, path=("# 安装", "## 准备")),
+            self._section("## 接线", "详细步骤" * 5, 1, path=("# 安装", "## 接线")),
+        ]
+
+        drafts = node._split_and_merge(
+            sections,
+            max_content_length=100,
+            min_content_length=45,
+            overlap_sentences=0,
+        )
+
+        self.assertEqual(len(drafts), 1)
+        self.assertEqual(drafts[0].source_section_indexes, (0, 1))
+        self.assertIn("## 准备", node._render_draft(drafts[0]))
+        self.assertIn("## 接线", node._render_draft(drafts[0]))
+
+    def test_short_tail_merges_backward_when_no_following_draft_exists(self) -> None:
+        node = self._make_node(max_length=100, min_length=35, overlap=0)
+        first = self._section("## 操作", "足够长的操作说明" * 4, 0, path=("# 安装", "## 操作"))
+        tail = self._section("## 注意", "短尾巴", 1, path=("# 安装", "## 注意"))
+        drafts = [node._draft_from_section(first), node._draft_from_section(tail)]
+
+        merged = node._merge_short_drafts(
+            drafts,
+            min_content_length=35,
+            max_content_length=100,
+        )
+
+        self.assertEqual(len(merged), 1)
+        self.assertEqual(merged[0].source_section_indexes, (0, 1))
+
+    def test_short_drafts_do_not_merge_across_top_level_headings(self) -> None:
+        node = self._make_node(max_length=100, min_length=40, overlap=0)
+        sections = [
+            self._section("## 收尾", "短", 0, path=("# 安装", "## 收尾")),
+            self._section("# 维护", "也很短", 1, path=("# 维护",)),
+        ]
+
+        drafts = node._split_and_merge(
+            sections,
+            max_content_length=100,
+            min_content_length=40,
+            overlap_sentences=0,
+        )
+
+        self.assertEqual(len(drafts), 2)
+
+    def test_step4_uses_common_heading_path_and_preserves_all_titles(self) -> None:
+        node = self._make_node(max_length=100, min_length=50, overlap=0)
+        parts = (
+            self._section("## 准备", "工具", 2, path=("# 安装", "## 准备")),
+            self._section("## 接线", "步骤", 3, path=("# 安装", "## 接线")),
+        )
+        draft = ChunkDraft(parts=parts, source_section_indexes=(2, 3))
+
+        chunks = node._assemble_chunks(
+            [draft],
+            file_title="设备手册",
+            source_path=Path("manual.md").resolve(),
+        )
+
+        self.assertEqual(chunks[0]["heading_path"], ["# 安装"])
+        self.assertEqual(chunks[0]["source_titles"], ["## 准备", "## 接线"])
+        self.assertEqual(chunks[0]["source_section_indexes"], [2, 3])
+        self.assertIn("## 准备\n\n工具", chunks[0]["content"])
+        self.assertIn("## 接线\n\n步骤", chunks[0]["content"])
 
     def test_base_node_preserves_classified_validation_error(self) -> None:
         with self.assertRaises(StateFieldError):

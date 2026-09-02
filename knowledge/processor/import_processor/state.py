@@ -8,9 +8,29 @@
 
 """
 
-from typing import TypedDict, List
+from typing import TypedDict
 
 import copy
+
+
+class ChunkRecord(TypedDict):
+    """Step 4 输出给向量化节点的稳定切片结构。
+
+    ``content`` 是后续 embedding 的主文本；其余字段保留标题路径和原始 section
+    映射，便于检索结果展示、问题排查以及未来按章节过滤。
+    """
+
+    chunk_index: int
+    file_title: str
+    title: str
+    parent_title: str
+    heading_path: list[str]
+    source_titles: list[str]
+    source_section_indexes: list[int]
+    body: str
+    content: str
+    char_count: int
+    source_path: str
 
 
 class ImportGraphState(TypedDict, total=False):
@@ -56,7 +76,7 @@ class ImportGraphState(TypedDict, total=False):
 
     md_content: str  # Markdown 文档内容
 
-    chunks: List  # 文档切片列表
+    chunks: list[ChunkRecord]  # Step 4 组装完成、可直接交给向量化节点的切片
 
     # ==================== 默认状态 ====================
 

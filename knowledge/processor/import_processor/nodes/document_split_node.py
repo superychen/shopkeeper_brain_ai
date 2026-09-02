@@ -1,20 +1,22 @@
-"""文档切分节点：Step 1 输入校验与 Step 2 Markdown 标题切分。
-
-当前阶段只完成标题级 section 的构建。Step 3 接入后会继续消费这些 section，
-完成超长切分和短内容合并；在此之前不把 section 写入 ``state["chunks"]``，
-避免下游误把中间数据当成最终向量化切片。
-"""
+"""文档切分节点：标题切分、长度治理以及最终 chunk 组装。"""
 
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+
 from knowledge.processor.import_processor.base import BaseNode, setup_logging
+from knowledge.processor.import_processor.config import ImportConfig
 from knowledge.processor.import_processor.exceptions import (
     ConfigurationError,
+    DocumentSplitError,
     StateFieldError,
 )
-from knowledge.processor.import_processor.state import ImportGraphState
+from knowledge.processor.import_processor.state import ChunkRecord, ImportGraphState
+from knowledge.processor.import_processor.utils.markdown_table_util import (
+    MarkdownTableUtil,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -55,6 +57,28 @@ class _FenceMarker:
     length: int
 
 
+@dataclass(frozen=True, slots=True)
+class _MarkdownBlock:
+    """Step 3 的内部文本块；atomic=True 表示不应从块内部切开。"""
+
+    text: str
+    kind: str
+    atomic: bool
+
+
+@dataclass(frozen=True, slots=True)
+class ChunkDraft:
+    """Step 3 结果：一个或多个 section 片段组成的待组装切片。
+
+    示例：``## 参数`` 正文过长时会先产生多个仅含一个 part 的 draft；若相邻
+    两个短 section 可以安全合并，则一个 draft 会包含两个 part。Step 4 再把它
+    转成可序列化的 :class:`ChunkRecord`。
+    """
+
+    parts: tuple[DocumentSection, ...]
+    source_section_indexes: tuple[int, ...]
+
+
 class DocumentSplitNode(BaseNode):
     """把 Markdown 一级切分为带标题层级关系的 section。
 
@@ -77,15 +101,47 @@ class DocumentSplitNode(BaseNode):
     _markdown_extensions = frozenset({".md", ".markdown"})
     _heading_pattern = re.compile(r"^ {0,3}(#{1,6})[ \t]+(.+?)[ \t]*$")
     _fence_pattern = re.compile(r"^ {0,3}(`{3,}|~{3,})(.*)$")
+    _image_line_pattern = re.compile(r"^\s*!\[[^\]]*]\([^\n]+\)\s*$")
+    _link_line_pattern = re.compile(r"^\s*\[[^\]]+]\([^\n]+\)\s*$")
+    _sentence_pattern = re.compile(r"[^。！？；.!?;]+[。！？；.!?;]?", re.S)
 
     def process(self, state: ImportGraphState) -> ImportGraphState:
-        """执行当前已完成的 Step 1/2，并保留后续步骤的接入位置。"""
-        sections = self.split_sections(state)
+        """依次执行 Step 1-4，并把最终切片写入 ``state["chunks"]``。"""
+        self.log_step("step_1", "获取并校验文档切分输入")
+        inputs = self._validate_state(state)
+
+        self.log_step("step_2", "按 Markdown 标题构建 section")
+        sections = self._split_by_headings(inputs.md_content, inputs.file_title)
         self.logger.info(
-            "文档标题切分完成，等待后续切分合并步骤: section_count=%d",
+            "Markdown 标题切分完成: section_count=%d",
             len(sections),
         )
-        # Step 3 将直接消费局部变量 sections；当前不写 chunks，防止中间结构泄漏。
+
+        self.log_step("step_3", "切分超长 section 并合并相邻短切片")
+        drafts = self._split_and_merge(
+            sections,
+            max_content_length=inputs.max_content_length,
+            min_content_length=inputs.min_content_length,
+            overlap_sentences=inputs.overlap_sentences,
+        )
+        self.logger.info(
+            "长度治理完成: section_count=%d, draft_count=%d",
+            len(sections),
+            len(drafts),
+        )
+
+        self.log_step("step_4", "组装向量化节点所需的 ChunkRecord")
+        chunks = self._assemble_chunks(
+            drafts,
+            file_title=inputs.file_title,
+            source_path=inputs.md_path,
+        )
+        state["chunks"] = chunks
+        self.logger.info(
+            "最终切片组装完成: chunk_count=%d, total_chars=%d",
+            len(chunks),
+            sum(chunk["char_count"] for chunk in chunks),
+        )
         return state
 
     def split_sections(self, state: ImportGraphState) -> list[DocumentSection]:
@@ -100,6 +156,450 @@ class DocumentSplitNode(BaseNode):
 
         self.log_step("step_2", "按 Markdown 标题构建 section")
         return self._split_by_headings(inputs.md_content, inputs.file_title)
+
+    def _split_and_merge(
+        self,
+        sections: list[DocumentSection],
+        *,
+        max_content_length: int,
+        min_content_length: int,
+        overlap_sentences: int,
+    ) -> list[ChunkDraft]:
+        """执行 Step 3：先切分超长 section，再合并相邻短 draft。
+
+        为什么顺序必须是“先长切、后短合”：
+
+        1. 如果先合并，两个本来不长的 section 可能先变成超长文本，标题边界也随之
+           模糊；先把所有内容约束到最大长度附近，后续合并更容易判断安全性。
+        2. 短合并只是优化检索上下文，不是硬性要求。只要跨顶层章节，或合并后超过
+           ``max_content_length``，宁可保留一个短 chunk 也不强行拼接。
+
+        示例 A——超长正文：标题占 8 字、上限 100 字时，正文预算约为 90 字。
+        LangChain 先按段落、换行、句末标点逐级寻找边界，实在找不到才按字符切分。
+
+        示例 B——短 section：同属 ``# 安装`` 的 ``## 准备``（80 字）与
+        ``## 接线``（120 字）在合并后不超过上限时可以合并，两个标题都会保留。
+
+        示例 C——跨章禁止合并：``# 安装`` 的尾段即使很短，也不会与紧随其后的
+        ``# 维护`` 合并，因为检索结果不能把两个顶层主题混成一个语义单元。
+        """
+        split_drafts: list[ChunkDraft] = []
+        for section in sections:
+            split_drafts.extend(
+                self._split_long_section(
+                    section,
+                    max_content_length=max_content_length,
+                    overlap_sentences=overlap_sentences,
+                )
+            )
+        return self._merge_short_drafts(
+            split_drafts,
+            min_content_length=min_content_length,
+            max_content_length=max_content_length,
+        )
+
+    def _split_long_section(
+        self,
+        section: DocumentSection,
+        *,
+        max_content_length: int,
+        overlap_sentences: int,
+    ) -> list[ChunkDraft]:
+        """在每片重复标题上下文，并用 LangChain 切分超长正文。
+
+        这里不把 ``title`` 截断为固定 50 字。标题本身是重要检索上下文，真正可用于
+        正文的预算应是 ``max - len(title) - 两个换行``。如果标题本身已经占满上限，
+        会抛出 ``DocumentSplitError``，提示调用方调整配置或治理异常标题。
+
+        Markdown 特殊结构示例：
+
+        - 围栏代码 `````python ... ````` 作为一个原子块，不会从代码中间切开；
+        - 独占一行的 ``![接线图](a.png)`` 不会拆坏 Markdown 语法；
+        - HTML 和管道表格统一由 ``MarkdownTableUtil`` 转成一维自然语言；HTML 中的
+          跨行/跨列会先展开，因此节点本身不再包含任何表格解析分支；
+        - 如果单个原子块自己就超过上限，只能完整保留并记录 warning。相比把代码或
+          图片语法切坏，这是更可恢复的降级方式。
+        """
+        # 表格解析、类型判断和语义转译全部封装在 util，节点只消费普通文本结果。
+        linearized_body = MarkdownTableUtil.process(section.body)
+        if linearized_body != section.body:
+            self.logger.debug(
+                "文档表格已完成降维转译: source_section_index=%d",
+                section.source_section_index,
+            )
+        normalized_section = replace(section, body=linearized_body)
+        rendered = self._render_section(normalized_section)
+        if len(rendered) <= max_content_length:
+            return [self._draft_from_section(normalized_section)]
+
+        title = normalized_section.title.strip()
+        title_cost = len(title) + (2 if normalized_section.body.strip() else 0)
+        body_budget = max_content_length - title_cost
+        if body_budget <= 0:
+            raise DocumentSplitError(
+                message=(
+                    "标题长度已占满切片上限，无法为正文分配空间: "
+                    f"source_section_index={section.source_section_index}, "
+                    f"title_length={len(title)}, max_content_length={max_content_length}"
+                ),
+                node_name=self.name,
+            )
+
+        body_parts = self._split_body_preserving_atoms(
+            normalized_section.body,
+            body_budget=body_budget,
+            source_section_index=section.source_section_index,
+        )
+        body_parts = self._apply_sentence_overlap(
+            body_parts,
+            body_budget=body_budget,
+            overlap_sentences=overlap_sentences,
+        )
+
+        self.logger.debug(
+            "超长 section 已拆分: source_section_index=%d, part_count=%d, body_budget=%d",
+            section.source_section_index,
+            len(body_parts),
+            body_budget,
+        )
+        return [
+            self._draft_from_section(replace(normalized_section, body=body_part))
+            for body_part in body_parts
+        ]
+
+    def _split_body_preserving_atoms(
+        self,
+        body: str,
+        *,
+        body_budget: int,
+        source_section_index: int,
+    ) -> list[str]:
+        """组合自定义结构保护与 ``RecursiveCharacterTextSplitter``。
+
+        LangChain 负责通用文本的递归边界选择；本方法只补充业务文档需要的原子结构
+        保护。普通文本依次尝试 ``空行 → 换行 → 中文/英文标点 → 空格 → 字符``，
+        因而既优先保持段落和句子，也保证没有自然边界的长串最终仍可切分。
+
+        例如 ``说明段 + 代码围栏 + 后续段`` 会先分成三个 block。说明段和后续段交给
+        LangChain；代码围栏整体作为一个 piece。最后按原顺序重新装箱，只要候选内容
+        不超过 ``body_budget`` 就尽量放在同一片中。
+        """
+        splitter = RecursiveCharacterTextSplitter(
+            chunk_size=body_budget,
+            chunk_overlap=0,
+            length_function=len,
+            keep_separator=True,
+            strip_whitespace=True,
+            separators=[
+                "\n\n",
+                "\n",
+                "。",
+                "！",
+                "？",
+                "；",
+                ".",
+                "!",
+                "?",
+                ";",
+                "，",
+                ",",
+                " ",
+                "",
+            ],
+        )
+
+        pieces: list[tuple[str, str, bool]] = []
+        for block in self._partition_markdown_blocks(body):
+            if block.atomic:
+                pieces.append((block.text.strip("\n"), block.kind, True))
+            else:
+                pieces.extend(
+                    (piece, block.kind, False)
+                    for piece in splitter.split_text(block.text)
+                )
+
+        packed: list[str] = []
+        current = ""
+        for piece, kind, atomic in pieces:
+            piece = piece.strip("\n")
+            if not piece.strip():
+                continue
+            if atomic and len(piece) > body_budget:
+                if current:
+                    packed.append(current)
+                    current = ""
+                packed.append(piece)
+                self.logger.warning(
+                    "Markdown 原子块超过正文预算，保留完整结构: "
+                    "source_section_index=%d, kind=%s, block_length=%d, body_budget=%d",
+                    source_section_index,
+                    kind,
+                    len(piece),
+                    body_budget,
+                )
+                continue
+
+            candidate = piece if not current else f"{current}\n\n{piece}"
+            if len(candidate) <= body_budget:
+                current = candidate
+            else:
+                if current:
+                    packed.append(current)
+                current = piece
+        if current:
+            packed.append(current)
+        return packed
+
+    def _partition_markdown_blocks(self, body: str) -> list[_MarkdownBlock]:
+        """识别必须整体保留的 Markdown 块，返回顺序不变的 block 列表。
+
+        识别场景：完整或未闭合的代码围栏，以及独占一行的 Markdown 图片/链接。
+        表格已经由 ``MarkdownTableUtil`` 转成普通自然语言；列表、引用和段落继续
+        交给 LangChain 寻找更自然的切点。
+        """
+        lines = body.split("\n")
+        blocks: list[_MarkdownBlock] = []
+        plain_lines: list[str] = []
+
+        def flush_plain() -> None:
+            text = "\n".join(plain_lines).strip("\n")
+            if text.strip():
+                blocks.append(_MarkdownBlock(text=text, kind="text", atomic=False))
+            plain_lines.clear()
+
+        index = 0
+        while index < len(lines):
+            line = lines[index]
+            opening_fence = self._match_opening_fence(line)
+            if opening_fence is not None:
+                flush_plain()
+                fence_lines = [line]
+                index += 1
+                while index < len(lines):
+                    fence_line = lines[index]
+                    fence_lines.append(fence_line)
+                    index += 1
+                    if self._is_closing_fence(fence_line, opening_fence):
+                        break
+                blocks.append(
+                    _MarkdownBlock(
+                        text="\n".join(fence_lines),
+                        kind="fenced_code",
+                        atomic=True,
+                    )
+                )
+                continue
+
+            if self._image_line_pattern.match(line):
+                flush_plain()
+                blocks.append(_MarkdownBlock(text=line, kind="image", atomic=True))
+                index += 1
+                continue
+
+            if self._link_line_pattern.match(line):
+                flush_plain()
+                blocks.append(_MarkdownBlock(text=line, kind="link", atomic=True))
+                index += 1
+                continue
+
+            plain_lines.append(line)
+            index += 1
+
+        flush_plain()
+        return blocks
+
+    def _apply_sentence_overlap(
+        self,
+        body_parts: list[str],
+        *,
+        body_budget: int,
+        overlap_sentences: int,
+    ) -> list[str]:
+        """把前片末尾若干完整句复制到后片开头，且不突破正文预算。
+
+        示例：前片为“先断电。再开盖。”、后片为“取出电池。”，配置 overlap=1
+        时后片会变成“再开盖。\n取出电池。”。若加入该句会超过上限，则逐句减少，
+        最终允许零重叠；因此 overlap 是“尽力而为”的检索增强，不是破坏长度上限的
+        硬指标。单个原子块本身已经超限时也不会继续追加重叠文本。
+        """
+        if overlap_sentences == 0 or len(body_parts) < 2:
+            return body_parts
+
+        overlapped = [body_parts[0]]
+        for current in body_parts[1:]:
+            if len(current) > body_budget:
+                overlapped.append(current)
+                continue
+
+            previous_sentences = [
+                sentence.strip()
+                for sentence in self._sentence_pattern.findall(overlapped[-1])
+                if sentence.strip()
+            ]
+            candidates = previous_sentences[-overlap_sentences:]
+            while candidates:
+                prefix = "".join(candidates)
+                candidate = f"{prefix}\n{current}"
+                if len(candidate) <= body_budget:
+                    current = candidate
+                    break
+                candidates.pop(0)
+            overlapped.append(current)
+        return overlapped
+
+    def _merge_short_drafts(
+        self,
+        drafts: list[ChunkDraft],
+        *,
+        min_content_length: int,
+        max_content_length: int,
+    ) -> list[ChunkDraft]:
+        """短片先向前合并，失败后再尝试并入已经输出的前一片。
+
+        “向前”能让标题后的短介绍和紧随其后的详细说明共同出现；文档尾部没有下一片
+        时，再尝试“向后”合并可避免孤立尾巴。两个方向都必须满足：
+
+        - 相邻且属于同一个顶层标题分支；
+        - 合并后的 ``title + body`` 总长度不超过 ``max_content_length``。
+
+        例如 ``# 安装 / ## 准备`` 与 ``# 安装 / ## 操作`` 可以合并，而
+        ``# 安装 / ## 收尾`` 与下一章 ``# 维护`` 即使都很短也不会合并。
+        """
+        merged: list[ChunkDraft] = []
+        index = 0
+        while index < len(drafts):
+            current = drafts[index]
+            index += 1
+
+            # 当前片仍偏短时，可连续吸收多个后继片；一旦语义或上限不满足便停止。
+            while len(self._render_draft(current)) < min_content_length and index < len(drafts):
+                following = drafts[index]
+                if not self._can_merge(current, following, max_content_length):
+                    break
+                current = self._combine_drafts(current, following)
+                index += 1
+
+            # 文档尾部或前向合并受阻时，最后尝试并入已经落定的前一片。
+            if (
+                len(self._render_draft(current)) < min_content_length
+                and merged
+                and self._can_merge(merged[-1], current, max_content_length)
+            ):
+                merged[-1] = self._combine_drafts(merged[-1], current)
+            else:
+                merged.append(current)
+        return merged
+
+    def _can_merge(
+        self,
+        left: ChunkDraft,
+        right: ChunkDraft,
+        max_content_length: int,
+    ) -> bool:
+        """判断两个相邻 draft 是否同属顶层语义分支且合并后不过长。"""
+        if self._top_level_key(left) != self._top_level_key(right):
+            return False
+        return len(self._render_draft(self._combine_drafts(left, right))) <= max_content_length
+
+    @staticmethod
+    def _combine_drafts(left: ChunkDraft, right: ChunkDraft) -> ChunkDraft:
+        """按原文顺序合并，并稳定去重原始 section 索引。"""
+        indexes = tuple(dict.fromkeys(left.source_section_indexes + right.source_section_indexes))
+        return ChunkDraft(
+            parts=left.parts + right.parts,
+            source_section_indexes=indexes,
+        )
+
+    def _assemble_chunks(
+        self,
+        drafts: list[ChunkDraft],
+        *,
+        file_title: str,
+        source_path: Path,
+    ) -> list[ChunkRecord]:
+        """执行 Step 4：将内部 draft 转成稳定、可序列化的 ChunkRecord。
+
+        单 section 示例：``source_titles=["## 电压"]``，``heading_path`` 保留完整
+        ``["# 测量", "## 电压"]``。多个短 section 合并后，``content`` 会依次保留
+        每个标题和正文，``source_titles`` 也记录全部标题；``heading_path`` 则取所有
+        part 的最长公共前缀，例如两个 H2 兄弟合并后得到 ``["# 测量"]``。
+
+        ``content`` 是 embedding 的主字段，``body`` 是不含标题的正文汇总；
+        ``char_count`` 始终等于 ``len(content)``，便于 Step 5 做统计和故障排查。
+        """
+        chunks: list[ChunkRecord] = []
+        for chunk_index, draft in enumerate(drafts):
+            first_part = draft.parts[0]
+            content = self._render_draft(draft)
+            chunks.append(
+                ChunkRecord(
+                    chunk_index=chunk_index,
+                    file_title=file_title,
+                    title=first_part.title,
+                    parent_title=first_part.parent_title,
+                    heading_path=list(self._common_heading_path(draft.parts)),
+                    source_titles=list(dict.fromkeys(part.title for part in draft.parts)),
+                    source_section_indexes=list(draft.source_section_indexes),
+                    body="\n\n".join(
+                        part.body.strip("\n")
+                        for part in draft.parts
+                        if part.body.strip()
+                    ),
+                    content=content,
+                    char_count=len(content),
+                    source_path=str(source_path),
+                )
+            )
+        return chunks
+
+    @staticmethod
+    def _draft_from_section(section: DocumentSection) -> ChunkDraft:
+        """把一个 section 或其长文片段包装成 Step 3 draft。"""
+        return ChunkDraft(
+            parts=(section,),
+            source_section_indexes=(section.source_section_index,),
+        )
+
+    @staticmethod
+    def _render_section(section: DocumentSection) -> str:
+        """按 ``title + 空行 + body`` 生成真正参与长度计算和 embedding 的文本。"""
+        title = section.title.strip()
+        body = section.body.strip("\n")
+        if title and body:
+            return f"{title}\n\n{body}"
+        return title or body
+
+    @classmethod
+    def _render_draft(cls, draft: ChunkDraft) -> str:
+        """合并时保留每个来源标题，避免正文脱离原始小节语义。"""
+        return "\n\n".join(
+            rendered
+            for part in draft.parts
+            if (rendered := cls._render_section(part))
+        )
+
+    @staticmethod
+    def _top_level_key(draft: ChunkDraft) -> str:
+        """返回 draft 所属最高层有效标题，用作短合并的语义边界。"""
+        first_path = draft.parts[0].heading_path
+        return first_path[0] if first_path else draft.parts[0].title
+
+    @staticmethod
+    def _common_heading_path(parts: tuple[DocumentSection, ...]) -> tuple[str, ...]:
+        """计算合并后各 part 的最长公共标题路径。"""
+        if not parts:
+            return ()
+        common: list[str] = []
+        for index, title in enumerate(parts[0].heading_path):
+            # 路径必须从根部连续相同；中间一层不同后，更深层即使同名也没有共同语义。
+            if all(
+                len(part.heading_path) > index and part.heading_path[index] == title
+                for part in parts[1:]
+            ):
+                common.append(title)
+            else:
+                break
+        return tuple(common)
 
     def _validate_state(self, state: ImportGraphState) -> SplitInputs:
         """校验状态和切分配置，并统一不同操作系统的换行符。"""
@@ -516,7 +1016,7 @@ class DocumentSplitNode(BaseNode):
 
 
 def main() -> None:
-    """使用内存 Markdown 展示标题跳级、父标题和代码围栏处理结果。"""
+    """使用小长度配置直观展示 Step 2 section 与 Step 3/4 chunks。"""
     setup_logging()
     example_markdown = """文档前言，不属于任何显式标题。
 
@@ -524,7 +1024,9 @@ def main() -> None:
 章节说明。
 
 ### 1.1 参数
-H1 直接跳到 H3，父标题仍应是“# 第一章”。
+H1 直接跳到 H3，父标题仍应是“# 第一章”。参数正文会重复多次，
+用于演示 LangChain 如何在句子边界附近拆分长 section。安全测量。正确接线。
+检查量程。读取数值。安全测量。正确接线。检查量程。读取数值。
 
 ```python
 # 这是代码注释，不是标题
@@ -542,13 +1044,32 @@ H1 直接跳到 H3，父标题仍应是“# 第一章”。
         "file_title": "文档切分示例",
     }
 
-    sections = DocumentSplitNode().split_sections(state)
+    node = DocumentSplitNode(
+        config=ImportConfig(
+            max_content_length=120,
+            min_content_length=45,
+            overlap_sentences=1,
+        )
+    )
+    sections = node.split_sections(state.copy())
+    print("\n=== Step 2: sections ===")
     for section in sections:
         print(
             f"[{section.source_section_index}] level={section.heading_level} "
             f"title={section.title!r} parent={section.parent_title!r} "
             f"path={' > '.join(section.heading_path)}"
         )
+
+    result = node.process(state)
+    print("\n=== Step 3/4: final chunks ===")
+    for chunk in result["chunks"]:
+        print(
+            f"[{chunk['chunk_index']}] chars={chunk['char_count']} "
+            f"sources={chunk['source_section_indexes']} "
+            f"path={' > '.join(chunk['heading_path'])}"
+        )
+        print(chunk["content"])
+        print("---")
 
 
 if __name__ == "__main__":
