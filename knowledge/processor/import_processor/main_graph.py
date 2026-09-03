@@ -8,6 +8,9 @@ from langgraph.graph.state import CompiledStateGraph
 
 from knowledge.processor.import_processor.config import ImportConfig
 from knowledge.processor.import_processor.exceptions import StateFieldError
+from knowledge.processor.import_processor.nodes.document_split_node import (
+    DocumentSplitNode,
+)
 from knowledge.processor.import_processor.nodes.entry_node import EntryNode
 from knowledge.processor.import_processor.nodes.md_to_img_node import MdToImgNode
 from knowledge.processor.import_processor.nodes.pdf_to_md_node import PdfToMdNode
@@ -42,11 +45,13 @@ def build_import_graph(
     entry_node = EntryNode(config=config)
     pdf_to_md_node = PdfToMdNode(config=config)
     md_to_img_node = MdToImgNode(config=config)
+    document_split_node = DocumentSplitNode(config=config)
 
     workflow = StateGraph(ImportGraphState)
     workflow.add_node(entry_node.name, entry_node)
     workflow.add_node(pdf_to_md_node.name, pdf_to_md_node)
     workflow.add_node(md_to_img_node.name, md_to_img_node)
+    workflow.add_node(document_split_node.name, document_split_node)
 
     workflow.add_edge(START, entry_node.name)
     workflow.add_conditional_edges(
@@ -59,13 +64,18 @@ def build_import_graph(
     )
     # PDF 转换会在 state 中写入 md_path，之后与直接导入 Markdown 共用图片处理节点。
     workflow.add_edge(pdf_to_md_node.name, md_to_img_node.name)
-    workflow.add_edge(md_to_img_node.name, END)
+    # 两条入口路径在图片处理后汇合，统一切分成可供后续 embedding 使用的 chunks。
+    workflow.add_edge(md_to_img_node.name, document_split_node.name)
+    # Embedding/Milvus 节点接入前，文档切分节点暂时作为导入图的末端。
+    workflow.add_edge(document_split_node.name, END)
 
     logger.info(
-        "导入流程图编排完成: entry=%s, pdf_node=%s, markdown_node=%s",
+        "导入流程图编排完成: entry=%s, pdf_node=%s, markdown_node=%s, "
+        "split_node=%s",
         entry_node.name,
         pdf_to_md_node.name,
         md_to_img_node.name,
+        document_split_node.name,
     )
     return workflow.compile(name="import_graph")
 

@@ -56,8 +56,9 @@ chunk 的 `content` 生成向量，`MilvusSaveNode` 再将 chunk、元数据和�
 - `BaseNode` 的统一调用、日志和异常处理框架。
 
 项目已新增 `document_split_node.py`，完成 Step 1 输入校验、Step 2 标题切分、
-Step 3 长切分/短合并和 Step 4 `ChunkRecord` 组装，并通过对应场景测试。Step 5 的
-统计备份尚未实现，因此 `main_graph.py` 仍暂不把该节点接到 `md_to_img_node` 之后。
+Step 3 长切分/短合并和 Step 4 `ChunkRecord` 组装，并通过对应场景测试。
+`main_graph.py` 已编排为 `md_to_img_node → document_split_node → END`；Step 5 的统计
+备份仍待实现，但不影响当前切片结果写入 `state["chunks"]`。
 
 ### 2.3 关键决策
 
@@ -112,8 +113,8 @@ flowchart LR
     MILVUS --> END((END))
 ```
 
-当前迭代实现 `document_split_node`。Step 5 完成后，在 Embedding 和 Milvus 节点尚未
-实现时可暂时使用 `document_split_node → END`；两个下游节点完成后再替换为完整链路。
+当前实际链路暂时以 `document_split_node → END` 结束；Embedding 和 Milvus 节点完成后，
+再替换为图中的完整入库链路。
 
 ### 4.2 节点内部五步流程
 
@@ -504,15 +505,7 @@ class DocumentSplitNode(BaseNode):
 
 ## 9. LangGraph 接入设计
 
-当前 `main_graph.py` 的末端是：
-
-```text
-pdf_to_md_node → md_to_img_node → END
-             ↗
-Markdown ────
-```
-
-本节点实现后调整为：
+当前 `main_graph.py` 已调整为：
 
 ```text
 pdf_to_md_node → md_to_img_node → document_split_node → END
@@ -520,7 +513,7 @@ pdf_to_md_node → md_to_img_node → document_split_node → END
 Markdown ────
 ```
 
-即在 `build_import_graph()` 中：
+`build_import_graph()` 已完成：
 
 1. 实例化并注册 `DocumentSplitNode(config=config)`；
 2. 将 `md_to_img_node → END` 改为 `md_to_img_node → document_split_node`；
@@ -646,5 +639,5 @@ Embedding/Milvus 技术设计中补充，不能用本机绝对路径作为跨环
 3. 实现 Step 1 和 Step 2，并完成标题/围栏测试；
 4. ~~实现 Step 3，并完成所有长度边界和合并测试；~~（已完成）
 5. Step 4 已完成；继续实现 Step 5 及 JSON 原子写入测试；
-6. 将节点接入 `main_graph.py`，完成 PDF/Markdown 双路径集成测试；
+6. ~~将节点接入 `main_graph.py`，完成 PDF/Markdown 双路径集成测试；~~（已完成）
 7. 单独设计并实现 Embedding 和 Milvus 入库节点。
