@@ -4,16 +4,17 @@ version = "0.1.0"
 requires-python = ">=3.12,<3.13"
 dependencies = [
     "grandalf",
-    "langchain-openai",
+    "langchain-deepseek",
     "langgraph",
     # Windows 使用 pipeline 执行本地 PDF 解析，避免引入 all extra 的完整 GPU 推理栈。
     "mineru[pipeline]; sys_platform == 'win32'",
     "mineru[all]; sys_platform != 'win32'",
     "minio",
     "openai-agents",
-    "pymilvus",
+    "pymilvus[model]",
     "pymongo",
     "pymupdf>=1.28.2",
+    "pydantic",
     "sentence-transformers",
     "langchain-text-splitters>=1.1.2",
     "beautifulsoup4>=4.15.0",

@@ -538,6 +538,19 @@ wheels = [
 ]
 
 [[package]]
+name = "langchain-deepseek"
+version = "1.1.0"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "langchain-core", marker = "platform_machine == 'AMD64' and sys_platform == 'win32'" },
+    { name = "langchain-openai", marker = "platform_machine == 'AMD64' and sys_platform == 'win32'" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/15/f4/200792013d86406aa02aba8d1b536f8877a832372702189aef0c8c7a8329/langchain_deepseek-1.1.0.tar.gz", hash = "sha256:5ec8128cabae3d71366e2f297dea2153649be317a4be7f135cfcad1160523bf6", size = 138078, upload-time = "2026-06-03T19:07:11.887Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/8c/1a/d18b7f985c35c635503a6cd426161933ffc7785f228d92447c63b026299a/langchain_deepseek-1.1.0-py3-none-any.whl", hash = "sha256:14813cb413a97a5cce95118da253cfd64dce50537b7381b7c5d0ecf11d2a7032", size = 10061, upload-time = "2026-06-03T19:07:11.04Z" },
+]
+
+[[package]]
 name = "langchain-openai"
 version = "1.6.0"
 source = { registry = "https://pypi.org/simple" }
@@ -1182,6 +1195,27 @@ wheels = [
     { url = "https://files.pythonhosted.org/packages/60/9d/7011887b29f452905745e8bd321f404068d5bfe78fe84e42c0b7cd81a065/pymilvus-3.0.1-py3-none-any.whl", hash = "sha256:c5a8d5c1fa1de7b416e3529d383d8cc2e7da2170433ffa4a2d9087e14f70171a", size = 386820, upload-time = "2026-07-29T14:55:44.279Z" },
 ]
 
+[package.optional-dependencies]
+model = [
+    { name = "pymilvus-model", marker = "platform_machine == 'AMD64' and sys_platform == 'win32'" },
+]
+
+[[package]]
+name = "pymilvus-model"
+version = "0.3.2"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "numpy", marker = "platform_machine == 'AMD64' and sys_platform == 'win32'" },
+    { name = "onnxruntime", marker = "platform_machine == 'AMD64' and sys_platform == 'win32'" },
+    { name = "protobuf", marker = "platform_machine == 'AMD64' and sys_platform == 'win32'" },
+    { name = "scipy", marker = "platform_machine == 'AMD64' and sys_platform == 'win32'" },
+    { name = "transformers", marker = "platform_machine == 'AMD64' and sys_platform == 'win32'" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/0c/8f/a8212f3d932d566fdec354b49befa09174b239c8b8ad25a33b798cee393b/pymilvus_model-0.3.2.tar.gz", hash = "sha256:10ab49a989396943e08555b971f85182ddb50da47076e699a157c9a5ff542872", size = 36268, upload-time = "2025-03-31T08:47:45.007Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/5b/ba/b34e3f8c57c453c02daf1a1eff9c4b62a2e89fc10a29bc83fb685155fe14/pymilvus_model-0.3.2-py3-none-any.whl", hash = "sha256:df8a90519a2adc47bd40f37d8c250b0ad0c7aaafc6139b52dc896d5cfda55d35", size = 47699, upload-time = "2025-03-31T08:47:43.372Z" },
+]
+
 [[package]]
 name = "pymongo"
 version = "4.17.0"
@@ -1477,13 +1511,14 @@ source = { virtual = "." }
 dependencies = [
     { name = "beautifulsoup4", marker = "platform_machine == 'AMD64' and sys_platform == 'win32'" },
     { name = "grandalf", marker = "platform_machine == 'AMD64' and sys_platform == 'win32'" },
-    { name = "langchain-openai", marker = "platform_machine == 'AMD64' and sys_platform == 'win32'" },
+    { name = "langchain-deepseek", marker = "platform_machine == 'AMD64' and sys_platform == 'win32'" },
     { name = "langchain-text-splitters", marker = "platform_machine == 'AMD64' and sys_platform == 'win32'" },
     { name = "langgraph", marker = "platform_machine == 'AMD64' and sys_platform == 'win32'" },
     { name = "mineru", extra = ["pipeline"], marker = "platform_machine == 'AMD64' and sys_platform == 'win32'" },
     { name = "minio", marker = "platform_machine == 'AMD64' and sys_platform == 'win32'" },
     { name = "openai-agents", marker = "platform_machine == 'AMD64' and sys_platform == 'win32'" },
-    { name = "pymilvus", marker = "platform_machine == 'AMD64' and sys_platform == 'win32'" },
+    { name = "pydantic", marker = "platform_machine == 'AMD64' and sys_platform == 'win32'" },
+    { name = "pymilvus", extra = ["model"], marker = "platform_machine == 'AMD64' and sys_platform == 'win32'" },
     { name = "pymongo", marker = "platform_machine == 'AMD64' and sys_platform == 'win32'" },
     { name = "pymupdf", marker = "platform_machine == 'AMD64' and sys_platform == 'win32'" },
     { name = "sentence-transformers", marker = "platform_machine == 'AMD64' and sys_platform == 'win32'" },
@@ -1493,14 +1528,15 @@ dependencies = [
 requires-dist = [
     { name = "beautifulsoup4", specifier = ">=4.15.0" },
     { name = "grandalf" },
-    { name = "langchain-openai" },
+    { name = "langchain-deepseek" },
     { name = "langchain-text-splitters", specifier = ">=1.1.2" },
     { name = "langgraph" },
     { name = "mineru", extras = ["all"], marker = "sys_platform != 'win32'" },
     { name = "mineru", extras = ["pipeline"], marker = "sys_platform == 'win32'" },
     { name = "minio" },
     { name = "openai-agents" },
-    { name = "pymilvus" },
+    { name = "pydantic" },
+    { name = "pymilvus", extras = ["model"] },
     { name = "pymongo" },
     { name = "pymupdf", specifier = ">=1.28.2" },
     { name = "sentence-transformers" },

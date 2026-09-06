@@ -1,4 +1,4 @@
-"""集中创建和复用对象存储客户端。"""
+"""集中创建和复用持久化服务客户端。"""
 
 from __future__ import annotations
 
@@ -8,10 +8,12 @@ from typing import ClassVar
 from urllib.parse import urlsplit
 
 from minio import Minio
+from pymilvus import MilvusClient
 
 from knowledge.processor.import_processor.config import ImportConfig, get_config
 from knowledge.processor.import_processor.exceptions import (
     ConfigurationError,
+    MilvusError,
     MinioError,
 )
 from knowledge.utils.client.base import BaseClientManager
@@ -21,12 +23,14 @@ logger = logging.getLogger("import.storage_clients")
 
 
 class StorageClients(BaseClientManager):
-    """管理 MinIO 及后续其他存储客户端的单例。"""
+    """管理 MinIO 和 Milvus 客户端单例。"""
 
     name = "storage_clients"
 
     _minio_client: ClassVar[Minio | None] = None
     _minio_lock: ClassVar[threading.Lock] = threading.Lock()
+    _milvus_client: ClassVar[MilvusClient | None] = None
+    _milvus_lock: ClassVar[threading.Lock] = threading.Lock()
 
     @classmethod
     def get_minio(cls) -> Minio:
@@ -89,6 +93,58 @@ class StorageClients(BaseClientManager):
             secure,
         )
         return client
+
+    @classmethod
+    def get_milvus(cls, config: ImportConfig | None = None) -> MilvusClient:
+        """获取 Milvus 客户端单例，复用底层连接而不是按文档重复建立连接。"""
+        active_config = config or get_config()
+        return cls._get_or_create(
+            instance_name="_milvus_client",
+            lock=cls._milvus_lock,
+            factory=lambda: cls._create_milvus(active_config),
+        )
+
+    @classmethod
+    def _create_milvus(cls, config: ImportConfig) -> MilvusClient:
+        """创建 Milvus 客户端，日志中不暴露鉴权 token。
+
+        例如本地 standalone 使用 ``http://127.0.0.1:19530`` 且 token 留空；连接远程
+        Milvus 时可沿用同一代码，只需在 .env 替换 URL 并提供服务端要求的 token。
+        """
+        uri = cls._require_config(
+            config=config,
+            field_name="milvus_url",
+            env_name="MILVUS_URL",
+        )
+        token = config.milvus_token.strip() if config.milvus_token else ""
+        client_kwargs = {"uri": uri}
+        if token:
+            client_kwargs["token"] = token
+
+        try:
+            client = MilvusClient(**client_kwargs)
+        except Exception as exc:
+            logger.error(
+                "创建 Milvus 客户端失败: endpoint=%s, error_type=%s",
+                cls._safe_endpoint(uri),
+                type(exc).__name__,
+            )
+            raise MilvusError(
+                message="创建 Milvus 客户端失败",
+                node_name=cls.name,
+                cause=exc,
+            ) from exc
+
+        logger.info("Milvus 客户端创建完成: endpoint=%s", cls._safe_endpoint(uri))
+        return client
+
+    @staticmethod
+    def _safe_endpoint(uri: str) -> str:
+        """只保留可安全记录的 Milvus endpoint。"""
+        parsed = urlsplit(uri)
+        if parsed.scheme and parsed.netloc:
+            return f"{parsed.scheme}://{parsed.netloc}"
+        return "configured-local-endpoint"
 
     @classmethod
     def _parse_endpoint(cls, config: ImportConfig) -> tuple[str, bool]:

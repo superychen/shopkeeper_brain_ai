@@ -8,27 +8,39 @@ from knowledge.processor.import_processor.nodes.document_split_node import (
     DocumentSplitNode,
 )
 from knowledge.processor.import_processor.nodes.entry_node import EntryNode
+from knowledge.processor.import_processor.nodes.item_name_recognition_node import (
+    ItemNameRecognitionNode,
+)
 from knowledge.processor.import_processor.nodes.md_to_img_node import MdToImgNode
 from knowledge.processor.import_processor.nodes.pdf_to_md_node import PdfToMdNode
 from knowledge.processor.import_processor.state import ImportGraphState
 
 
 class MainGraphTest(unittest.TestCase):
-    """确保两种入口最终都经过 DocumentSplitNode。"""
+    """确保两种入口最终都经过切分和商品名称节点。"""
 
     def test_graph_places_document_split_after_markdown_image_node(self) -> None:
         graph = build_import_graph().get_graph()
         edges = {(edge.source, edge.target) for edge in graph.edges}
 
         self.assertIn("document_split_node", graph.nodes)
+        self.assertIn("item_name_recognition_node", graph.nodes)
         self.assertIn(("md_to_img_node", "document_split_node"), edges)
-        self.assertIn(("document_split_node", "__end__"), edges)
+        self.assertIn(
+            ("document_split_node", "item_name_recognition_node"),
+            edges,
+        )
+        self.assertIn(("item_name_recognition_node", "__end__"), edges)
+        self.assertNotIn(("document_split_node", "__end__"), edges)
         self.assertNotIn(("md_to_img_node", "__end__"), edges)
 
     def test_markdown_route_executes_entry_image_and_split_in_order(self) -> None:
         result = self._invoke_with_fake_nodes("manual.md")
 
-        self.assertEqual(result["item_name"], "entry>md_to_img>document_split")
+        self.assertEqual(
+            result["item_name"],
+            "entry>md_to_img>document_split>item_name_recognition",
+        )
         self.assertEqual(result["chunks"], [{"content": "切分完成"}])
 
     def test_pdf_route_executes_pdf_image_and_split_in_order(self) -> None:
@@ -36,7 +48,7 @@ class MainGraphTest(unittest.TestCase):
 
         self.assertEqual(
             result["item_name"],
-            "entry>pdf_to_md>md_to_img>document_split",
+            "entry>pdf_to_md>md_to_img>document_split>item_name_recognition",
         )
         self.assertEqual(result["chunks"], [{"content": "切分完成"}])
 
@@ -84,12 +96,20 @@ class MainGraphTest(unittest.TestCase):
             state["chunks"] = [{"content": "切分完成"}]  # type: ignore[list-item]
             return state
 
+        def fake_item_name(
+            _node: ItemNameRecognitionNode,
+            state: ImportGraphState,
+        ) -> ImportGraphState:
+            append_trace(state, "item_name_recognition")
+            return state
+
         # patch.object 类似 Java 测试里的替身对象：保留真实图，只隔离节点内部副作用。
         with (
             patch.object(EntryNode, "process", fake_entry),
             patch.object(PdfToMdNode, "process", fake_pdf),
             patch.object(MdToImgNode, "process", fake_image),
             patch.object(DocumentSplitNode, "process", fake_split),
+            patch.object(ItemNameRecognitionNode, "process", fake_item_name),
         ):
             return build_import_graph().invoke(
                 {

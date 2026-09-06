@@ -1,16 +1,7 @@
-"""
-
-导入流程状态类型定义
-
-
-
-定义完整的状态结构和辅助函数
-
-"""
-
-from typing import TypedDict
+"""导入流程状态类型定义。"""
 
 import copy
+from typing import Literal, NotRequired, TypedDict
 
 
 class ChunkRecord(TypedDict):
@@ -32,23 +23,16 @@ class ChunkRecord(TypedDict):
     char_count: int
     source_path: str
 
+    # 切分阶段不生成商品名，识别成功后才由商品名称节点补充。
+    item_name: NotRequired[str]
 
 class ImportGraphState(TypedDict, total=False):
-
-
-    """
-
-    导入流程图状态
-
-
-
-    包含整个导入流程中传递的所有数据
-
-    """
+    """包含整个导入流程中传递的数据。"""
 
     # ==================== 任务标识 ====================
 
     task_id: str  # 任务 ID，用于任务追踪(web交互的时候用到，实时看到节点的处理日志)
+    document_id: str  # 跨重试稳定的文档标识，用于 Milvus 幂等写入
 
     # ==================== 控制标志 ====================
 
@@ -71,42 +55,33 @@ class ImportGraphState(TypedDict, total=False):
     file_title: str  # 文件标题（不含扩展名）
 
     item_name: str  # 识别出的商品/产品名称(方便程序员用)
+    item_name_status: Literal["recognized", "not_found", "ambiguous"]
+    item_name_confidence: float  # 仅表示输入证据充分度，不代表商品质量评分
+    item_name_evidence: list[str]  # 例如 ["RS PRO", "RS-12", "数字万用表"]
+    item_name_milvus_pk: str  # 写库成功后回填的稳定 SHA-256 主键
 
     # ==================== 处理中间数据 ====================
 
     md_content: str  # Markdown 文档内容
 
     chunks: list[ChunkRecord]  # Step 4 组装完成、可直接交给向量化节点的切片
-
-    # ==================== 默认状态 ====================
-
-
-
-
 GRAPH_DEFAULT_STATE: ImportGraphState = {
-
     "task_id": "",
-
+    "document_id": "",
     "is_pdf_read_enabled": False,
-
     "is_md_read_enabled": False,
-
     "file_dir": "",
-
     "import_file_path": "",
-
     "pdf_path": "",
-
     "md_path": "",
-
     "file_title": "",
-
     "md_content": "",
-
     "chunks": [],
-
     "item_name": "",
-
+    "item_name_status": "not_found",
+    "item_name_confidence": 0.0,
+    "item_name_evidence": [],
+    "item_name_milvus_pk": "",
 }
 
 

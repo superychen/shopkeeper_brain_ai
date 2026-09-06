@@ -22,6 +22,22 @@ def _get_env_bool(name: str, default: bool = False) -> bool:
     return raw_value.strip().casefold() in {"1", "true", "yes", "on"}
 
 
+def _get_env_int(name: str, default: int) -> int:
+    """读取整数环境变量，具体取值范围由使用它的节点校验。
+
+    例如环境变量不存在时 ``_get_env_int("EMBEDDING_DIM", 1024)`` 返回 1024；
+    若配置为非数字字符串则在启动构造配置时立即失败，避免错误值流入模型层。
+    """
+    raw_value = os.getenv(name)
+    return default if raw_value is None else int(raw_value)
+
+
+def _get_env_float(name: str, default: float) -> float:
+    """读取浮点环境变量，允许超时等配置使用 ``30`` 或 ``30.5``。"""
+    raw_value = os.getenv(name)
+    return default if raw_value is None else float(raw_value)
+
+
 @dataclass
 class ImportConfig:
     """导入流程配置"""
@@ -71,16 +87,26 @@ class ImportConfig:
     deepseek_llm_model: str = field(
         default_factory=lambda: os.getenv("DEEPSEEK_LLM_MODEL", "")
     )
+    deepseek_timeout_seconds: float = field(
+        default_factory=lambda: _get_env_float("DEEPSEEK_TIMEOUT_SECONDS", 30.0)
+    )
+    # 该值是“首次请求之后”的最大重试次数；2 表示总尝试次数最多为 3。
+    deepseek_max_retries: int = field(
+        default_factory=lambda: _get_env_int("DEEPSEEK_MAX_RETRIES", 2)
+    )
 
     # ==================== Milvus 配置 ====================
     milvus_url: str = field(
         default_factory=lambda: os.getenv("MILVUS_URL", "")
     )
+    milvus_token: str = field(
+        default_factory=lambda: os.getenv("MILVUS_TOKEN", "")
+    )
     chunks_collection: str = field(
         default_factory=lambda: os.getenv("CHUNKS_COLLECTION", "")
     )
     item_name_collection: str = field(
-        default_factory=lambda: os.getenv("ITEM_NAME_COLLECTION", "")
+        default_factory=lambda: os.getenv("ITEM_NAME_COLLECTION", "kb_item_names_v1")
     )
     entity_name_collection: str = field(
         default_factory=lambda: os.getenv("ENTITY_NAME_COLLECTION", "")
@@ -106,9 +132,15 @@ class ImportConfig:
 
     # ==================== 向量配置 ====================
     embedding_dim: int = field(
-        default_factory=lambda: int(os.getenv("EMBEDDING_DIM", "1024"))
+        default_factory=lambda: _get_env_int("EMBEDDING_DIM", 1024)
     )
     embedding_batch_size: int = 8
+    bge_m3_model_name: str = field(
+        default_factory=lambda: os.getenv("BGE_M3_MODEL_NAME", "BAAI/bge-m3")
+    )
+    bge_m3_device: str = field(
+        default_factory=lambda: os.getenv("BGE_M3_DEVICE", "auto")
+    )
 
     # ==================== 速率限制 ====================
     requests_per_minute: int = 15  # 图片总结 API 速率限制

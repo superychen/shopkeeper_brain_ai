@@ -1,4 +1,4 @@
-"""AI 客户端管理器的公共基础能力。"""
+"""客户端管理器的公共基础能力。"""
 
 from __future__ import annotations
 

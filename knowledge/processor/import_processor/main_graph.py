@@ -12,6 +12,9 @@ from knowledge.processor.import_processor.nodes.document_split_node import (
     DocumentSplitNode,
 )
 from knowledge.processor.import_processor.nodes.entry_node import EntryNode
+from knowledge.processor.import_processor.nodes.item_name_recognition_node import (
+    ItemNameRecognitionNode,
+)
 from knowledge.processor.import_processor.nodes.md_to_img_node import MdToImgNode
 from knowledge.processor.import_processor.nodes.pdf_to_md_node import PdfToMdNode
 from knowledge.processor.import_processor.state import ImportGraphState
@@ -46,12 +49,14 @@ def build_import_graph(
     pdf_to_md_node = PdfToMdNode(config=config)
     md_to_img_node = MdToImgNode(config=config)
     document_split_node = DocumentSplitNode(config=config)
+    item_name_recognition_node = ItemNameRecognitionNode(config=config)
 
     workflow = StateGraph(ImportGraphState)
     workflow.add_node(entry_node.name, entry_node)
     workflow.add_node(pdf_to_md_node.name, pdf_to_md_node)
     workflow.add_node(md_to_img_node.name, md_to_img_node)
     workflow.add_node(document_split_node.name, document_split_node)
+    workflow.add_node(item_name_recognition_node.name, item_name_recognition_node)
 
     workflow.add_edge(START, entry_node.name)
     workflow.add_conditional_edges(
@@ -66,16 +71,19 @@ def build_import_graph(
     workflow.add_edge(pdf_to_md_node.name, md_to_img_node.name)
     # 两条入口路径在图片处理后汇合，统一切分成可供后续 embedding 使用的 chunks。
     workflow.add_edge(md_to_img_node.name, document_split_node.name)
-    # Embedding/Milvus 节点接入前，文档切分节点暂时作为导入图的末端。
-    workflow.add_edge(document_split_node.name, END)
+    # 商品名节点依赖已经完成的 chunks，并在同一个节点内完成识别、向量化、入库和回填。
+    # 不拆成多条图边，可避免断点恢复时暴露“已识别但尚未写入 Milvus”的半完成状态。
+    workflow.add_edge(document_split_node.name, item_name_recognition_node.name)
+    workflow.add_edge(item_name_recognition_node.name, END)
 
     logger.info(
         "导入流程图编排完成: entry=%s, pdf_node=%s, markdown_node=%s, "
-        "split_node=%s",
+        "split_node=%s, item_name_node=%s",
         entry_node.name,
         pdf_to_md_node.name,
         md_to_img_node.name,
         document_split_node.name,
+        item_name_recognition_node.name,
     )
     return workflow.compile(name="import_graph")
 
