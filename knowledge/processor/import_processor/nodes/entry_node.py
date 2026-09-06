@@ -1,4 +1,8 @@
-"""导入流程入口节点。"""
+"""文件入口校验与分流：run_import_graph → EntryNode → PDF 或 Markdown 节点。
+
+读取 import_file_path/document_id，校验文件后写入规范路径和两个互斥路由标志。
+这里只识别文件，不解析正文；格式解析由后续节点完成。
+"""
 
 import hashlib
 from pathlib import Path
@@ -15,7 +19,11 @@ class EntryNode(BaseNode):
     _markdown_extensions = frozenset({".md", ".markdown"})
 
     def process(self, state: ImportGraphState) -> ImportGraphState:
-        """根据导入文件扩展名启用 PDF 或 Markdown 处理分支。"""
+        """校验输入 → 规范路径 → 确定文档 ID → 设置分支 → 返回状态。
+
+        文档 ID 缺省时按文件内容生成。更新文档后若要覆盖原文档记录，应由调用方
+        显式传入原 document_id；否则内容改变会得到新 ID，按新文档导入。
+        """
         if not isinstance(state, dict):
             raise StateFieldError(
                 node_name=self.name,
@@ -31,6 +39,7 @@ class EntryNode(BaseNode):
                 expected_type=str,
             )
 
+        # 第一步：expanduser 展开用户目录，casefold 使 .PDF 等大小写扩展名等价。
         normalized_path = import_file_path.strip()
         input_path = Path(normalized_path).expanduser()
         extension = input_path.suffix.casefold()
@@ -55,15 +64,17 @@ class EntryNode(BaseNode):
                 message=f"导入文件不存在或不是普通文件: {input_path}",
             )
 
+        # 第二步：确认是真实文件后固定绝对路径，后续图片相对路径以此定位。
         input_path = input_path.resolve()
         normalized_path = str(input_path)
+        # 第三步：稳定业务 ID 与 task_id 分工不同，前者决定覆盖对象，后者追踪本次执行。
         document_id = state.get("document_id")
         if document_id is None or document_id == "":
             # 当前没有独立文档表时，以文件内容摘要提供跨重试稳定的幂等标识。
             # 例如同一个 RS-12.pdf 重试两次会得到相同 document_id，从而 upsert 同一条
             # Milvus 记录；即使文件改名，只要内容不变，标识也保持不变。
             state["document_id"] = self._hash_file(input_path)
-        elif not isinstance(document_id, str) or not document_id.strip():
+        elif not isinstance(document_id, str) or not document_id.strip() or "\0" in document_id or len(document_id.encode("utf-8")) > 128:
             raise StateFieldError(
                 node_name=self.name,
                 field_name="document_id",

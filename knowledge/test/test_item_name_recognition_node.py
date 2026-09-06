@@ -233,7 +233,7 @@ class ItemNameRecognitionNodeTest(unittest.TestCase):
                 source_text="RS PRO RS-12 数字万用表",
             )
 
-    def test_not_found_skips_embedding_and_milvus(self) -> None:
+    def test_not_found_skips_embedding_and_cleans_old_name(self) -> None:
         fake_chain = _FakeRecognitionChain(
             {
                 "status": "not_found",
@@ -255,6 +255,7 @@ class ItemNameRecognitionNodeTest(unittest.TestCase):
             ),
             patch.object(AIClients, "get_bge_m3") as get_bge_m3,
             patch.object(StorageClients, "get_milvus") as get_milvus,
+            patch.object(self.node._repository, "delete_document") as delete_document,
         ):
             result = self.node.process(state)
 
@@ -263,6 +264,7 @@ class ItemNameRecognitionNodeTest(unittest.TestCase):
         self.assertNotIn("item_name", result["chunks"][0])
         get_bge_m3.assert_not_called()
         get_milvus.assert_not_called()
+        delete_document.assert_called_once_with("document-1")
 
     def test_success_creates_collection_upserts_and_publishes_new_chunks(self) -> None:
         fake_chain = _FakeRecognitionChain(self._recognized_payload())

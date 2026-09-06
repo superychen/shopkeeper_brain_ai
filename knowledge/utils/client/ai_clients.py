@@ -2,6 +2,10 @@
 
 DeepSeek 文本/视觉模型通过远程 API 调用；BGE-M3 则在当前 Python 进程加载本地模型。
 管理器只负责客户端生命周期和配置，商品名称抽取规则仍留在业务节点与 Prompt 中。
+
+调用关系：图片节点 → get_vlm；商品名节点 → get_llm；两种编码服务 → get_bge_m3。
+get_* 通过父类的锁与缓存复用实例，首次访问才执行 _create_*；实际推理由业务层调用。
+同一进程共享第一次创建的客户端，后续传入不同配置不会自动重建已有实例。
 """
 
 from __future__ import annotations
@@ -38,18 +42,18 @@ class AIClients(BaseClientManager):
     _bge_m3_lock: ClassVar[threading.Lock] = threading.Lock()
 
     @classmethod
-    def get_vlm(cls) -> OpenAI:
+    def get_vlm(cls, config: ImportConfig | None = None) -> OpenAI:
         """获取使用 DeepSeek OpenAI 兼容接口的 VLM 客户端。"""
         return cls._get_or_create(
             instance_name="_vlm_client",
             lock=cls._vlm_lock,
-            factory=cls._create_vlm,
+            factory=lambda: cls._create_vlm(config),
         )
 
     @classmethod
-    def _create_vlm(cls) -> OpenAI:
+    def _create_vlm(cls, config: ImportConfig | None = None) -> OpenAI:
         """读取 DeepSeek 配置并创建视觉模型使用的原生客户端。"""
-        config = get_config()
+        config = config or get_config()
         api_base = cls._require_config(
             config=config,
             field_name="deepseek_api_base",
@@ -120,6 +124,7 @@ class AIClients(BaseClientManager):
         )
 
         try:
+            # 商品名提取只需简短结构化结果，固定温度并关闭思考输出以控制响应形态。
             client = ChatDeepSeek(
                 model=model,
                 api_key=api_key,
@@ -181,14 +186,19 @@ class AIClients(BaseClientManager):
             import torch
             from pymilvus.model.hybrid import BGEM3EmbeddingFunction
 
+            # 第一步：auto 根据硬件选择设备；显式指定的设备则交给模型加载器处理。
             device = configured_device
             if device.casefold() == "auto":
                 device = "cuda:0" if torch.cuda.is_available() else "cpu"
             use_fp16 = device.casefold().startswith("cuda")
+            # 第二步：只生成入库所需 dense/sparse；关闭未使用的 ColBERT 多向量输出。
             client = BGEM3EmbeddingFunction(
                 model_name=model_name,
                 device=device,
                 use_fp16=use_fp16,
+                return_dense=True,
+                return_sparse=True,
+                return_colbert_vecs=False,
             )
         except Exception as exc:
             logger.error(

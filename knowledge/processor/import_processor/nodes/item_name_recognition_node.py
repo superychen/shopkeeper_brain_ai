@@ -3,6 +3,11 @@
 典型示例：文档前部出现“RS PRO”“RS-12”“数字万用表”时，DeepSeek 先返回
 ``RS PRO RS-12 数字万用表`` 及原文证据；随后本地 BGE-M3 生成稠密/稀疏向量，
 Milvus upsert 成功后，节点才把名称和主键一次性回填到 state 及所有 chunks。
+
+上游 DocumentSplitNode 提供 chunks；本节点先校验和裁剪识别上下文，再请求 DeepSeek。
+recognized：名称编码 → 商品名集合 upsert → 回填名称。
+not_found/ambiguous：删除同文档旧商品记录 → 回填空名称与识别状态。
+两个正常分支最终都进入 BgeEmbeddingChunksNode，继续对文档切片编码与入库。
 """
 
 from __future__ import annotations
@@ -79,6 +84,7 @@ class ItemNameRecognitionNode(BaseNode):
     _quote_pairs = (("\"", "\""), ("'", "'"), ("“", "”"), ("‘", "’"))
 
     def __init__(self, config: ImportConfig | None = None) -> None:
+        """组装服务对象；识别链首次使用时才创建，避免初始化时发起模型请求。"""
         super().__init__(config=config)
         self._recognition_chain: (
                 Runnable[dict[str, str], ItemNameExtraction] | None
@@ -92,6 +98,7 @@ class ItemNameRecognitionNode(BaseNode):
         顺序是业务一致性约束：如果 BGE-M3 或 Milvus 失败，state 不应提前出现
         ``recognized`` 成功态；任务重试时会继续使用相同 document_id 和 Milvus 主键。
         """
+        # 第一步：得到经过校验的输入快照，再按数量和长度限制构造识别证据。
         inputs = self._validate_inputs(state)
         context = self._build_recognition_context(inputs)
         self.logger.info(
@@ -103,8 +110,11 @@ class ItemNameRecognitionNode(BaseNode):
             len(context),
         )
 
+        # 第二步：模型输出经过结构化解析与业务校验，再按识别结果选择持久化行为。
         result = self._recognize_with_deepseek(inputs.file_title, context)
         if result.status != "recognized":
+            # 新一轮识别可能失去明确名称；先清除历史索引，避免仍检索到旧商品。
+            self._repository.delete_document(inputs.document_id)
             # not_found/ambiguous 是合法业务结果，不应浪费本地模型计算或产生脏库记录。
             # 例如同时介绍两个并列型号、无法判断主次时，只回填 ambiguous 状态。
             self._fill_unrecognized_state(state, result)
@@ -120,6 +130,7 @@ class ItemNameRecognitionNode(BaseNode):
             )
             return state
 
+        # 第三步：只给已确认的名称计算向量；这是商品索引，尚未写入文档切片集合。
         vectors = self._embedding_service.embed(result.item_name)
         item_pk = self._repository.upsert(
             collection_name=inputs.collection_name,

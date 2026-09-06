@@ -4,6 +4,8 @@ import unittest
 from unittest.mock import patch
 
 from knowledge.processor.import_processor.main_graph import build_import_graph
+from knowledge.processor.import_processor.nodes.bge_embedding_chunks_node import BgeEmbeddingChunksNode
+from knowledge.processor.import_processor.nodes.milvus_import_node import MilvusImportNode
 from knowledge.processor.import_processor.nodes.document_split_node import (
     DocumentSplitNode,
 )
@@ -30,7 +32,10 @@ class MainGraphTest(unittest.TestCase):
             ("document_split_node", "item_name_recognition_node"),
             edges,
         )
-        self.assertIn(("item_name_recognition_node", "__end__"), edges)
+        self.assertNotIn(("item_name_recognition_node", "__end__"), edges)
+        self.assertIn(("item_name_recognition_node", "bge_embedding_chunks_node"), edges)
+        self.assertIn(("bge_embedding_chunks_node", "milvus_import_node"), edges)
+        self.assertIn(("milvus_import_node", "__end__"), edges)
         self.assertNotIn(("document_split_node", "__end__"), edges)
         self.assertNotIn(("md_to_img_node", "__end__"), edges)
 
@@ -39,7 +44,7 @@ class MainGraphTest(unittest.TestCase):
 
         self.assertEqual(
             result["item_name"],
-            "entry>md_to_img>document_split>item_name_recognition",
+            "entry>md_to_img>document_split>item_name_recognition>embedding>milvus",
         )
         self.assertEqual(result["chunks"], [{"content": "切分完成"}])
 
@@ -48,7 +53,7 @@ class MainGraphTest(unittest.TestCase):
 
         self.assertEqual(
             result["item_name"],
-            "entry>pdf_to_md>md_to_img>document_split>item_name_recognition",
+            "entry>pdf_to_md>md_to_img>document_split>item_name_recognition>embedding>milvus",
         )
         self.assertEqual(result["chunks"], [{"content": "切分完成"}])
 
@@ -103,6 +108,14 @@ class MainGraphTest(unittest.TestCase):
             append_trace(state, "item_name_recognition")
             return state
 
+        def fake_embedding(_node, state):
+            append_trace(state, "embedding")
+            return state
+
+        def fake_milvus(_node, state):
+            append_trace(state, "milvus")
+            return state
+
         # patch.object 类似 Java 测试里的替身对象：保留真实图，只隔离节点内部副作用。
         with (
             patch.object(EntryNode, "process", fake_entry),
@@ -110,6 +123,8 @@ class MainGraphTest(unittest.TestCase):
             patch.object(MdToImgNode, "process", fake_image),
             patch.object(DocumentSplitNode, "process", fake_split),
             patch.object(ItemNameRecognitionNode, "process", fake_item_name),
+            patch.object(BgeEmbeddingChunksNode, "process", fake_embedding),
+            patch.object(MilvusImportNode, "process", fake_milvus),
         ):
             return build_import_graph().invoke(
                 {

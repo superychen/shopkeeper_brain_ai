@@ -1,4 +1,9 @@
-"""PDF 转 Markdown 节点。"""
+"""PDF 转 Markdown 节点，仅 PDF 分支会经过这里。
+
+EntryNode 设置 pdf_path → 校验输入和输出目录 → 启动 MinerU 子进程
+→ 定位生成的 Markdown → 写入 state.md_path → MdToImgNode 处理图片。
+本节点不直接生成向量；转换失败抛 PdfConversionError，中止后续节点。
+"""
 
 import os
 import subprocess

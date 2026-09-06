@@ -1,4 +1,9 @@
-"""集中创建和复用持久化服务客户端。"""
+"""集中创建和复用存储连接，不承载切片组装或入库核验等业务规则。
+
+图片上传组件 → get_minio → 首次创建连接并确保 bucket 存在。
+商品名/切片仓储 → get_milvus → 首次创建连接 → 仓储负责 schema 和数据操作。
+父类使用锁缓存实例，进程内后续请求复用首次配置；修改配置不会自动重建连接。
+"""
 
 from __future__ import annotations
 
@@ -33,18 +38,18 @@ class StorageClients(BaseClientManager):
     _milvus_lock: ClassVar[threading.Lock] = threading.Lock()
 
     @classmethod
-    def get_minio(cls) -> Minio:
+    def get_minio(cls, config: ImportConfig | None = None) -> Minio:
         """获取 MinIO 客户端，并保证配置的 bucket 已经存在。"""
         return cls._get_or_create(
             instance_name="_minio_client",
             lock=cls._minio_lock,
-            factory=cls._create_minio,
+            factory=lambda: cls._create_minio(config),
         )
 
     @classmethod
-    def _create_minio(cls) -> Minio:
+    def _create_minio(cls, config: ImportConfig | None = None) -> Minio:
         """读取 MinIO 配置，创建客户端并按需初始化 bucket。"""
-        config = get_config()
+        config = config or get_config()
         endpoint, secure = cls._parse_endpoint(config)
         access_key = cls._require_config(
             config=config,
@@ -117,11 +122,13 @@ class StorageClients(BaseClientManager):
             env_name="MILVUS_URL",
         )
         token = config.milvus_token.strip() if config.milvus_token else ""
+        # 仅在配置非空时传 token，兼容本地无鉴权实例；kwargs 不得写入日志。
         client_kwargs = {"uri": uri}
         if token:
             client_kwargs["token"] = token
 
         try:
+            # ** 将字典展开为关键字参数，相当于逐个传入 uri=...、token=...。
             client = MilvusClient(**client_kwargs)
         except Exception as exc:
             logger.error(
@@ -140,7 +147,10 @@ class StorageClients(BaseClientManager):
 
     @staticmethod
     def _safe_endpoint(uri: str) -> str:
-        """只保留可安全记录的 Milvus endpoint。"""
+        """日志省略路径、查询参数与片段，仅保留协议和 netloc。
+
+        鉴权应通过独立 token 配置传入；本函数不会额外清洗 netloc 内的用户信息。
+        """
         parsed = urlsplit(uri)
         if parsed.scheme and parsed.netloc:
             return f"{parsed.scheme}://{parsed.netloc}"

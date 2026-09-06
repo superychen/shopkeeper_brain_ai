@@ -1,4 +1,10 @@
-"""文档切分节点：标题切分、长度治理以及最终 chunk 组装。"""
+"""文档切分节点：标题切分、长度治理以及最终 chunk 组装。
+
+上游 MdToImgNode 提供图片处理后的 md_content；本节点按标题解析章节，
+在保留表格/代码结构的前提下治理过长或过短内容，再组装连续编号的 ChunkRecord。
+输出 chunks 先交给 ItemNameRecognitionNode 回填商品名，再由编码节点生成向量。
+阅读顺序建议从 DocumentSplitNode.process 开始，按其中步骤进入辅助方法。
+"""
 
 import re
 from dataclasses import dataclass, replace

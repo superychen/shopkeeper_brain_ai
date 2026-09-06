@@ -3,6 +3,10 @@
 该层只处理持久化，不关心商品名称怎样识别。示例：同一 document_id 第一次识别为
 “RS PRO RS-12 数字万用表”，重新导入后名称修正，两个请求会生成相同主键并执行
 upsert，因此 Milvus 中仍然只有一条该文档的商品记录。
+
+已识别名称：upsert → ensure_collection → schema/索引校验 → 写入 → 返回主键。
+未识别或名称歧义：delete_document → 定位同文档旧主键 → 删除并读回确认。
+这属于切片编码之前的商品名索引步骤，最终切片写入由 ChunkRepository 负责。
 """
 
 from __future__ import annotations
@@ -31,6 +35,7 @@ class ItemNameRepository:
     _collection_lock = threading.Lock()
 
     def __init__(self, config: ImportConfig) -> None:
+        """保存集合与向量配置；客户端在真正执行数据库操作时获取。"""
         self.config = config
 
     def upsert(
@@ -66,7 +71,9 @@ class ItemNameRepository:
 
         started_at = time.perf_counter()
         try:
-            client.upsert(collection_name=collection_name, data=[entity])
+            result = client.upsert(collection_name=collection_name, data=[entity])
+            if not isinstance(result, dict) or result.get("upsert_count") != 1:
+                raise MilvusError(message="商品名称 upsert 返回数量不一致")
         except Exception as exc:
             logger.error(
                 "Milvus 商品名称 upsert 失败: collection=%s, pk=%s, error_type=%s",
@@ -87,6 +94,30 @@ class ItemNameRepository:
             time.perf_counter() - started_at,
         )
         return item_pk
+
+    def delete_document(self, document_id: str) -> None:
+        """重导入不再识别出商品时清理旧名称；不存在集合时直接结束。
+
+        主键算法必须与 upsert 一致，仅删除当前 document_id 对应的商品记录。
+        Strong 读回仍能查到记录时抛异常，阻止下游把未完成清理当作成功。
+        """
+        client = StorageClients.get_milvus(self.config)
+        name = self.config.item_name_collection
+        try:
+            if not client.has_collection(collection_name=name, timeout=self.config.milvus_timeout_seconds):
+                return
+            self.ensure_collection(client, name)
+            # 先校验集合再删除，避免在不兼容的集合中执行业务清理。
+            pk = hashlib.sha256(f"item-name:v1\0{document_id}".encode("utf-8")).hexdigest()
+            client.delete(collection_name=name, ids=[pk], timeout=self.config.milvus_timeout_seconds)
+            # 加载集合供查询使用，再以强一致读确认删除已对本次核验可见。
+            client.load_collection(collection_name=name, timeout=self.config.milvus_timeout_seconds)
+            if client.get(collection_name=name, ids=[pk], output_fields=["pk"],
+                          consistency_level="Strong", timeout=self.config.milvus_timeout_seconds):
+                raise MilvusError(message="旧商品记录删除后仍可见")
+        except Exception as exc:
+            raise MilvusError(message="清理旧商品名称失败", node_name="item_name_repository", cause=exc) from exc
+        logger.info("旧商品名称清理完成: document_id=%s", document_id)
 
     def ensure_collection(
         self,
@@ -300,4 +331,5 @@ class ItemNameRepository:
 
     @staticmethod
     def _incompatible(message: str) -> None:
+        """统一把 schema/索引差异报告为配置错误，便于与网络存储故障区分。"""
         raise ConfigurationError(message=message, node_name="item_name_repository")

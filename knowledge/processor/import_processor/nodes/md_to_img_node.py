@@ -1,4 +1,14 @@
-"""Markdown 本地图片处理节点的结构定义。"""
+"""图片处理节点：把本地图片引用转换成带摘要的可检索 Markdown 内容。
+
+上游：EntryNode 直接提供 Markdown 路径，或 PdfToMdNode 提供转换结果。
+内部走向：_MdFileHandler 读文档 → HTML 图片语法归一化 → _ImageScanner 找正文引用
+→ _VLMSummarizer 生成摘要 → _ImageUploader 上传并替换 → 保存新 Markdown
+→ 回填 md_content/md_path 及降级计数 → DocumentSplitNode 切片。
+
+阅读时先看文件末尾 MdToImgNode.process，再进入四个协作类的具体方法。
+图片摘要失败可以使用默认描述；单张上传失败保留本地引用并报告警告。
+文件读取、必要配置或客户端初始化等无法继续的故障仍会抛出异常。
+"""
 
 import base64
 import logging
@@ -27,6 +37,7 @@ from knowledge.processor.import_processor.exceptions import (
 from knowledge.processor.import_processor.state import ImportGraphState
 from knowledge.utils.client.ai_clients import AIClients
 from knowledge.utils.client.storage_clients import StorageClients
+from knowledge.processor.import_processor.utils.markdown_image_util import normalize_html_images, transform_prose, image_references
 
 
 @dataclass(frozen=True)
@@ -221,14 +232,25 @@ class _ImageScanner:
             ) from exc
 
         image_list: list[_ImageInfo] = []
+        # 先排除代码里的伪引用，再利用原正文提取标题上下文。
+        referenced_paths = set()
+        for match in image_references(md_content, self._image_pattern):
+            destination = self._extract_destination(match.group("destination"))
+            if destination and not urlsplit(destination).scheme:
+                referenced_paths.add((image_dir.parent / unquote(urlsplit(destination).path)).resolve())
+        context_content = transform_prose(md_content, lambda text: text,
+                                          lambda code: re.sub(r"[^\r\n]", " ", code))
+        # 代码只置为空格而保留换行，后续按行查标题时不会把代码中的 # 当成章节。
         for image_path in image_paths:
             if not image_path.is_file():
                 continue
             if image_path.suffix.casefold() not in normalized_extensions:
                 continue
+            if image_path.resolve() not in referenced_paths:
+                continue
 
             context = self._find_context(
-                md_content=md_content,
+                md_content=context_content,
                 image_name=image_path.name,
                 max_chars=context_length,
             )
@@ -510,9 +532,9 @@ class _VLMSummarizer:
             summaries[image.path] = summary
             # 用户需要在处理过程中看到结果，因此逐张输出摘要但不输出 Base64 和上下文。
             self.logger.info(
-                "VLM 图片摘要生成完成: image_name=%s, summary=%s",
+                "VLM 图片摘要生成完成: image_name=%s, summary_chars=%d",
                 image.name,
-                summary,
+                len(summary),
             )
 
         self.logger.info("VLM 摘要处理完成: image_count=%d", len(summaries))
@@ -683,6 +705,7 @@ class _ImageUploader:
         self.logger = logger
         self.node_name = node_name
         self._client_factory = client_factory or StorageClients.get_minio
+        self.failure_count = 0
 
     def upload_and_replace(
         self,
@@ -695,10 +718,12 @@ class _ImageUploader:
     ) -> str:
         """上传图片，并返回替换图片引用后的 Markdown 内容。
 
-        MinIO 中的对象统一写入 ``knowledge/{文档名}/{图片名}``。只有所有
-        图片都上传成功后才替换内存中的 Markdown，避免失败时返回半更新内容。
+        MinIO 中的对象统一写入 ``knowledge/{文档名}/{图片名}``。先收集全部上传
+        结果，再统一替换内存中的 Markdown；单张失败保留其原引用，成功项正常替换。
         本方法不写本地 Markdown 文件，文件落盘由后续 Step 5 负责。
         """
+        # 协作对象可被复用，每次执行先清零，避免上一文档的失败数累计到当前任务。
+        self.failure_count = 0
         if not image_list:
             self.logger.info("没有有效图片，跳过 MinIO 上传和 Markdown 替换")
             return md_content
@@ -808,6 +833,7 @@ class _ImageUploader:
             self._is_remote_url(image_url)
             for image_url in image_urls.values()
         )
+        self.failure_count = len(image_list) - uploaded_count
         self.logger.info(
             "MinIO 图片批量上传结束: total=%d, success=%d, fallback=%d",
             len(image_list),
@@ -915,6 +941,10 @@ class _ImageUploader:
             image = images_by_name.get(image_name.casefold())
             if image is None or image.path not in image_urls:
                 return match.group(0)
+            referenced_path = (image.path.parent.parent / unquote(parsed_destination.path)).resolve()
+            if referenced_path != image.path:
+                # 同名并不代表同一资源，例如 other/a.jpg 不能替换成 images/a.jpg。
+                return match.group(0)
 
             image_url = image_urls[image.path]
             if not self._is_remote_url(image_url):
@@ -926,7 +956,7 @@ class _ImageUploader:
             return f"![{normalized_summary}]({image_url})"
 
         # re.sub 支持回调函数：每个匹配项都由 replace_image 动态决定替换结果。
-        return _ImageScanner._image_pattern.sub(replace_image, md_content)
+        return transform_prose(md_content, lambda text: _ImageScanner._image_pattern.sub(replace_image, text))
 
     def _normalize_document_directory(self, document_name: str) -> str:
         """生成安全且稳定的文档目录名，同时保留可读的中文名称。"""
@@ -979,17 +1009,24 @@ class MdToImgNode(BaseNode):
     name = "md_to_img_node"
 
     def __init__(self, config: ImportConfig | None = None) -> None:
+        """创建四个处理组件，并用延迟工厂把同一份配置传给外部客户端。"""
         super().__init__(config=config)
         # 协作对象只在节点初始化时创建一次，process 仅负责串联处理步骤。
         self._file_handler = _MdFileHandler(self.logger, self.name)
         self._image_scanner = _ImageScanner(self.logger, self.name)
-        self._vlm_summarizer = _VLMSummarizer(self.logger, self.name)
-        self._image_uploader = _ImageUploader(self.logger, self.name)
+        self._vlm_summarizer = _VLMSummarizer(self.logger, self.name, client_factory=lambda: AIClients.get_vlm(self.config))
+        self._image_uploader = _ImageUploader(self.logger, self.name, client_factory=lambda: StorageClients.get_minio(self.config))
 
     def process(self, state: ImportGraphState) -> ImportGraphState:
-        """依次调用文件、扫描、摘要和上传组件处理 Markdown 图片。"""
+        """读取 md_path，按五个步骤生成正文，最后回填状态交给切分节点。
+
+        摘要/上传计数是结果质量信息，不代表切片入库已成功；导入成功标志只由
+        后面的 MilvusImportNode 在数据库核验通过后设置。
+        """
         self.log_step("step_1", "读取 Markdown 内容并定位图片目录")
         md_content, md_path, image_dir = self._file_handler.read_md(state)
+        # 扫描器统一识别 Markdown 图片，先转换正文中的 <img>，保留代码示例。
+        md_content = normalize_html_images(md_content)
 
         self.log_step("step_2", "扫描有效图片并组装上下文")
         image_list = self._image_scanner.scan_img_dir(
@@ -1022,6 +1059,28 @@ class MdToImgNode(BaseNode):
 
         state["md_content"] = new_md_content
         state["md_path"] = str(new_md_path)
+        # 以默认摘要文本统计降级次数；sum 会将比较结果 True/False 当作 1/0 相加。
+        fallback_count = sum(value == _VLMSummarizer._fallback_summary for value in image_summaries.values())
+        state["image_summary_fallback_count"] = fallback_count
+        state["image_upload_failure_count"] = self._image_uploader.failure_count
+        # 复制已有警告列表再追加，保留上游信息，避免直接修改旧列表对象。
+        warnings = list(state.get("import_warnings", []))
+        if fallback_count:
+            warnings.append(f"图片摘要降级: {fallback_count}")
+        if self._image_uploader.failure_count:
+            warnings.append(f"图片上传失败: {self._image_uploader.failure_count}")
+        # 原文中存在引用不代表已处理：远程图片或未匹配到本地图片的引用单独报告。
+        # 此处按文件名做覆盖统计，计数的是引用次数，不是去重后的图片数量。
+        refs = image_references(md_content, _ImageScanner._image_pattern)
+        known = {image.name for image in image_list}
+        unresolved = 0
+        for match in refs:
+            destination = _ImageScanner._extract_destination(match.group("destination"))
+            if destination and (urlsplit(destination).scheme or PurePosixPath(unquote(destination)).name not in known):
+                unresolved += 1
+        if unresolved:
+            warnings.append(f"远程或未解析图片引用: {unresolved}")
+        state["import_warnings"] = warnings
         return state
 
 
