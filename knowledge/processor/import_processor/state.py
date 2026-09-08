@@ -73,6 +73,9 @@ class ImportGraphState(TypedDict, total=False):
 
     # ==================== 处理中间数据 ====================
 
+    # API 门面给出归档对象键；raw_md_path 在图片处理前保存，避免丢失原始转换内容。
+    source_archive: dict
+    raw_md_path: str
     md_content: str  # Markdown 文档内容
 
     chunks: list[ChunkRecord]  # Step 4 组装完成、可直接交给向量化节点的切片

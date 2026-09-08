@@ -27,6 +27,8 @@ class MilvusImportNode(BaseNode):
         仓储若在任一步失败，此方法不会发布成功状态；但此前的数据库写入可能已发生，
         这不是跨批次事务。重试由稳定主键 upsert 保证不会不断增加重复记录。
         """
+        # 【流程 07.7 · 切片入库】调用 ChunkRepository.write 完成写入、读回核验和旧切片清理。
+        # 本节点返回 succeeded 后图结束；API 任务仍需回到门面完成流程 08 归档。
         # Step 1：write 内部完成所有写入和读回校验；返回顺序与输入切片一致。
         entities = self._repository.write(state)
         # Step 2：只修改副本，给调用方保留入库前状态用于诊断。

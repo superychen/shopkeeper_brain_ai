@@ -24,6 +24,7 @@ class EntryNode(BaseNode):
         文档 ID 缺省时按文件内容生成。更新文档后若要覆盖原文档记录，应由调用方
         显式传入原 document_id；否则内容改变会得到新 ID，按新文档导入。
         """
+        # 【流程 07.1 · 检查文件】确定文件类型和路径；PDF 接 07.2，Markdown 跳过转换直接接 07.3。
         if not isinstance(state, dict):
             raise StateFieldError(
                 node_name=self.name,

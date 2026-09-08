@@ -62,6 +62,7 @@ def _route_import_file(state: ImportGraphState) -> ImportRoute:
 
 def build_import_graph(
     config: ImportConfig | None = None,
+    observer=None,
 ) -> CompiledStateGraph:
     """组装并编译可执行图；此处定义连接关系，不实际执行导入。
 
@@ -78,14 +79,33 @@ def build_import_graph(
     milvus_node = MilvusImportNode(config=config)
 
     # 第二步：注册“名字 → 可调用节点”的映射；注册先后顺序并不决定执行顺序。
+    def tracked(node):
+        """包装统一调用边界：先报告运行，再执行节点，最后报告成功或失败。"""
+        if observer is None:
+            return node
+
+        def execute(state):
+            """节点异常仍向图传播，观察者只记录进度，不替代原有异常处理。"""
+            # 【节点进度顺序】running → BaseNode.__call__ → 节点 process → completed。
+            # process 抛异常则报告 failed 并向门面传播；节点异常后不再执行后续图节点。
+            observer(node.name, "running")
+            try:
+                update = node(state)
+            except Exception:
+                observer(node.name, "failed")
+                raise
+            observer(node.name, "completed")
+            return update
+        return execute
+
     workflow = StateGraph(ImportGraphState)
-    workflow.add_node(entry_node.name, entry_node)
-    workflow.add_node(pdf_to_md_node.name, pdf_to_md_node)
-    workflow.add_node(md_to_img_node.name, md_to_img_node)
-    workflow.add_node(document_split_node.name, document_split_node)
-    workflow.add_node(item_name_recognition_node.name, item_name_recognition_node)
-    workflow.add_node(embedding_node.name, embedding_node)
-    workflow.add_node(milvus_node.name, milvus_node)
+    workflow.add_node(entry_node.name, tracked(entry_node))
+    workflow.add_node(pdf_to_md_node.name, tracked(pdf_to_md_node))
+    workflow.add_node(md_to_img_node.name, tracked(md_to_img_node))
+    workflow.add_node(document_split_node.name, tracked(document_split_node))
+    workflow.add_node(item_name_recognition_node.name, tracked(item_name_recognition_node))
+    workflow.add_node(embedding_node.name, tracked(embedding_node))
+    workflow.add_node(milvus_node.name, tracked(milvus_node))
 
     # 第三步：用边定义真正的执行顺序。只有入口按文件格式分支，后续全部串行。
     workflow.add_edge(START, entry_node.name)
@@ -126,6 +146,8 @@ def build_import_graph(
 def run_import_graph(
     state: ImportGraphState,
     config: ImportConfig | None = None,
+    observer=None,
+    source_archive=None,
 ) -> ImportGraphState:
     """对外执行入口：接收文件路径及可选任务/文档 ID，返回完整最终状态。
 
@@ -133,6 +155,8 @@ def run_import_graph(
     此入口每次从头运行，不从调用方提供的 chunks 或成功标志恢复。
     调用失败直接向上抛异常，调用方可保留 document_id 后重试完整导入。
     """
+    # 【流程 06 · 图入口】由 ImportTaskFacade._run 调用；先创建独立状态，再取得串行锁并 invoke。
+    # 图按下方流程 07.1～07.7 执行；核验最终结果后返回门面，继续流程 08 的产物归档。
     # 第一步：拒绝错误配置，再创建本次任务独立的初始状态。
     if not isinstance(state, dict):
         raise StateFieldError(field_name="state", expected_type=dict)
@@ -141,6 +165,9 @@ def run_import_graph(
     # 完整重跑只接收入口字段，防止上次成功态、主键或旧向量污染新任务。
     initial = create_default_state(**{key: state[key] for key in
                                    ("import_file_path", "document_id", "task_id") if key in state})
+    # 归档地址只由任务门面传入，不接受 HTTP 请求任意指定内部存储路径。
+    if source_archive is not None:
+        initial["source_archive"] = source_archive
     initial["task_id"] = initial.get("task_id") or uuid.uuid4().hex
     initial["import_status"] = "running"
     task_id = initial["task_id"]
@@ -148,7 +175,7 @@ def run_import_graph(
     # 单进程只允许一个完整导入，图内串行本身不能保护两个并发 invoke。
     with _import_lock:
         # 锁只保护当前 Python 进程；多进程部署仍需在外层实现文档级协调。
-        result = build_import_graph(config=config).invoke(initial)
+        result = build_import_graph(config=config, observer=observer).invoke(initial)
     # 第三步：检查图的最终业务结果，不能仅因 invoke 没抛异常就判定导入成功。
     if (result.get("import_status") != "succeeded"
             or result.get("written_chunk_count") != len(result.get("chunks", []))):

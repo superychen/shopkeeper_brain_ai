@@ -113,6 +113,7 @@ class DocumentSplitNode(BaseNode):
 
     def process(self, state: ImportGraphState) -> ImportGraphState:
         """依次执行 Step 1-4，并把最终切片写入 ``state["chunks"]``。"""
+        # 【流程 07.4 · 文档切片】读取处理后的正文，按标题及长度切分成 chunks，再交给 07.5 商品名识别。
         self.log_step("step_1", "获取并校验文档切分输入")
         inputs = self._validate_state(state)
 

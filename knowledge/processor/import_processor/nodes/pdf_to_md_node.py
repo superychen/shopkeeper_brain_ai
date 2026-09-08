@@ -25,6 +25,7 @@ class PdfToMdNode(BaseNode):
 
     def process(self, state: ImportGraphState) -> ImportGraphState:
         """校验路径并调用 MinerU 完成 PDF 转换。"""
+        # 【流程 07.2 · PDF 转换】调用 MinerU 生成 Markdown 和资源，回填 md_path 后进入 07.3 图片处理。
         input_path, output_dir = self._validate_state(state)
         self.logger.info(
             "PDF 转换状态校验通过: input_path=%s, output_dir=%s",

@@ -98,6 +98,8 @@ class ItemNameRecognitionNode(BaseNode):
         顺序是业务一致性约束：如果 BGE-M3 或 Milvus 失败，state 不应提前出现
         ``recognized`` 成功态；任务重试时会继续使用相同 document_id 和 Milvus 主键。
         """
+        # 【流程 07.5 · 商品名】DeepSeek 识别名称；明确名称用 BGE 编码并写商品名集合，否则清除旧名称。
+        # 名称结果回填后进入 07.6；这里的数据库操作与最后写入文档切片是两件事。
         # 第一步：得到经过校验的输入快照，再按数量和长度限制构造识别证据。
         inputs = self._validate_inputs(state)
         context = self._build_recognition_context(inputs)

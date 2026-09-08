@@ -161,6 +161,9 @@ class ChunkRepository:
             entity.update(item_name=state.get("item_name", ""), item_name_milvus_pk=state.get("item_name_milvus_pk", ""),
                           embedding_text_hash=chunk.get("embedding_text_hash", ""),
                           metadata={key: chunk[key] for key in META_FIELDS})
+            # JSON 元数据允许补充归档关联，不必修改已有集合 schema。
+            if state.get("source_archive"):
+                entity["metadata"]["source_archive"] = state["source_archive"]
             # Step 4：使用与建表一致的字节限制；metadata另设32KiB应用上限。
             for key, value in entity.items():
                 if key in TEXT_FIELDS:
@@ -207,6 +210,8 @@ class ChunkRepository:
         任一阶段失败都抛异常；调用者不能把“部分批次已成功”解释为整份导入成功。
         外层run_import_graph持有单进程导入锁；直接调用仓储时由调用者保证互斥。
         """
+        # 【流程 07.7 · 入库内部】先校验全部实体，再逐批写入；全部读回核验后才清旧尾部并检查总数。
+        # 返回 MilvusImportNode 回填主键；任一步异常都交给门面处理，不在这里宣布 API 任务成功。
         # Step 1：先做所有本地校验、实体映射与分批，再连接外部数据库。
         entities = self.prepare(state)
         batches = self.batches(entities)

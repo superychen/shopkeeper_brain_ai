@@ -34,6 +34,8 @@ class BgeEmbeddingChunksNode(BaseNode):
 
         注意返回的是字典，不是切片列表；LangGraph 会把这些字段合并回整张图的状态。
         """
+        # 【流程 07.6 · 切片编码】调用 ChunkEmbeddingService.embed，用本地 BGE-M3 生成稠密和稀疏向量。
+        # 所有批次完成才把带向量的 chunks 交给 07.7 入库；DeepSeek 不负责这里的向量化。
         # Step 1：整份文档先通过结构校验，避免编码几批后才发现后面的切片损坏。
         chunks = validate_chunks(state, self.config)
         # Step 2：列表推导式保持原顺序。商品名只加入编码副本，不覆盖 chunk.content。

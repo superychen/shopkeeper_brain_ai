@@ -84,6 +84,7 @@ class ChunkEmbeddingService:
         处理顺序：取模型 → 检查所有文本长度 → 计算指纹 → 顺序分批编码 → 汇总返回。
         texts 已由节点规范化；本方法不再切正文。任何文本超长或批次失败都抛 EmbeddingError。
         """
+        # 【流程 07.6 · 编码内部】本方法由 BgeEmbeddingChunksNode 调用；分批编码后按输入顺序返回全部向量。
         started = time.perf_counter()
         try:
             # Step 1：循环外只取一次单例，各批次共享模型权重和设备资源。

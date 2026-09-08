@@ -1,0 +1,115 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>知识库文件导入</title>
+  <style>
+    *{box-sizing:border-box}body{margin:0;background:#0f172a;color:#e2e8f0;font:15px/1.7 system-ui,sans-serif}
+    main{max-width:900px;margin:48px auto;padding:0 22px}h1{font-size:30px;margin-bottom:4px}p{color:#94a3b8}
+    #drop{border:2px dashed #38bdf8;border-radius:16px;padding:38px;text-align:center;background:#17243a;cursor:pointer}
+    button{background:#38bdf8;color:#082f49;border:0;border-radius:8px;padding:10px 20px;cursor:pointer;font:inherit}
+    input[type=text]{padding:9px;border-radius:8px;border:1px solid #475569;background:#17243a;color:white;width:100%}
+    .card{margin-top:20px;padding:22px;background:#1e293b;border:1px solid #334155;border-radius:14px}
+    .header{display:flex;justify-content:space-between;gap:15px;overflow-wrap:anywhere}.badge{color:#7dd3fc;white-space:nowrap}
+    progress{width:100%;height:16px;accent-color:#38bdf8;margin:16px 0 0}.muted{color:#94a3b8;font-size:13px}
+    ol{padding-left:22px}li{padding:3px 0}.completed{color:#86efac}.running{color:#7dd3fc}.failed,.error{color:#fca5a5}.skipped{color:#64748b}
+    .warning{color:#fde68a;white-space:pre-wrap}.result{white-space:pre-wrap;overflow-wrap:anywhere;font-size:13px}.actions{margin-top:10px}
+  </style>
+</head>
+<body><main>
+  <h1>知识库文件导入</h1><p>上传文档后自动完成解析、切片、向量入库和文件归档。</p>
+  <div id="drop" role="button" tabindex="0"><strong>点击选择或拖拽 PDF / Markdown 文件</strong><br><span class="muted">支持多个文件排队处理，单文件默认不超过 100 MiB</span></div>
+  <input id="files" type="file" accept=".pdf,.md,.markdown" multiple hidden>
+  <p class="muted">Markdown 单文件不会携带本地 images 目录；完整图文建议上传 PDF。</p>
+  <details><summary>更新已有文档（可选）</summary><label>业务文档 ID<input id="document" type="text" placeholder="仅更新单个文档时填写；否则留空"></label></details>
+  <section id="list" aria-live="polite"></section>
+</main>
+<script>
+  // 默认同源访问 /import。独立部署页面时可在 localStorage 设置 ragApiBase。
+  let API = '';
+  try { API = (localStorage.getItem('ragApiBase') || '').replace(/\/$/, ''); } catch { /* 默认同源 */ }
+  const storageKey = 'ragImportTasks';
+  const labels = {queued:'排队中',processing:'处理中',completed:'已完成',failed:'失败'};
+  const list = document.getElementById('list');
+  const files = document.getElementById('files');
+  const drop = document.getElementById('drop');
+  let saved;
+  try { saved = JSON.parse(localStorage.getItem(storageKey) || '[]'); } catch { saved = []; }
+  if (!Array.isArray(saved)) saved = [];
+
+  // 只保存任务编号与文件名，刷新后继续查询；不保存用户文件内容。
+  function remember(){
+    try {localStorage.setItem(storageKey, JSON.stringify(saved.slice(-30)));}
+    catch { /* 浏览器禁止存储时仍允许当前页面正常上传和轮询。 */ }
+  }
+  function card(name){
+    // 文件名只通过 textContent 设置，不能拼进 HTML，否则恶意名称可能执行脚本。
+    const el = document.createElement('article'); el.className='card';
+    el.innerHTML='<div class="header"><strong></strong><span class="badge">上传中</span></div><progress max="100"></progress><div class="muted summary">正在传输文件…</div><ol></ol><div class="warning"></div><div class="result"></div><div class="actions"></div>';
+    el.querySelector('strong').textContent=name; list.prepend(el); return el;
+  }
+  async function responseJson(response){
+    // HTTP 请求失败与后台任务失败分开处理：后者仍是 200 响应中的 failed 状态。
+    const data=await response.json();
+    if(!response.ok) throw Object.assign(new Error(typeof data.detail==='string'?data.detail:'请求失败'),{status:response.status});
+    return data;
+  }
+  async function upload(file){
+    // 【流程 01】选择文件后提交 POST /upload；后端接口从流程 02 接手。
+    // 每个文件独立提交并建立卡片，真正的串行顺序由后端队列保证。
+    const el=card(file.name); const body=new FormData(); body.append('file',file);
+    const id=document.getElementById('document').value.trim(); if(id)body.append('document_id',id);
+    try {
+      const data=await responseJson(await fetch(API+'/upload',{method:'POST',body}));
+      // 拿到 task_id 只表示已入队；立即进入流程 10 查询，不能在这里显示导入成功。
+      saved.push({id:data.task_id,name:file.name});remember();poll(data.task_id,el);
+    } catch(error){
+      el.querySelector('.badge').textContent='上传失败';el.querySelector('.summary').textContent=error.message;
+      el.querySelector('progress').value=0;
+    }
+  }
+  function render(el,data){
+    // 完全采用后端步骤与进度，不在浏览器推测 PDF 或模型的完成时间。
+    el.querySelector('.badge').textContent=labels[data.status]||data.status;
+    el.querySelector('progress').value=data.progress_percent;
+    el.querySelector('.summary').textContent=`${data.finished_steps}/${data.total_steps} 步 · 已等待 ${data.elapsed_seconds.toFixed(1)} 秒 · 进度 ${data.progress_percent}%`;
+    const ol=el.querySelector('ol');ol.replaceChildren();
+    for(const step of data.steps){
+      const li=document.createElement('li');li.className=step.status;
+      const text={pending:'等待',running:'执行中',completed:'完成',failed:'失败',skipped:'不适用'}[step.status];
+      li.textContent=`${step.label}：${text} · ${step.duration_seconds.toFixed(1)} 秒`;ol.append(li);
+    }
+    el.querySelector('.warning').textContent=(data.warnings||[]).join('\n');
+    el.querySelector('.result').textContent=data.error?data.error.message:(data.result?`已写入 ${data.result.written_chunk_count} 条切片\n文档 ID：${data.document_id}\n归档：${data.result.archive?.object_key||''}`:'');
+  }
+  function poll(id,el){
+    // 【流程 10】查询 TaskStore 的快照：queued/processing 时继续，completed/failed 时停止。
+    // completed/failed 为终态；网络故障只重试查询，绝不自动重复上传文档。
+    let failures=0;
+    async function tick(){
+      // 上次请求结束后才安排下一次，慢接口不会产生重叠轮询。
+      const controller=new AbortController();const timeout=setTimeout(()=>controller.abort(),10000);
+      try {
+        const data=await responseJson(await fetch(API+'/status/'+encodeURIComponent(id),{signal:controller.signal,cache:'no-store'}));
+        failures=0;render(el,data);
+        if(['completed','failed'].includes(data.status)){saved=saved.filter(t=>t.id!==id);remember();return;}
+        setTimeout(tick,1500);
+      } catch(error){
+        failures++;el.querySelector('.summary').textContent=error.status===404?'任务不存在、已过期或服务已重启':`查询暂时失败（${failures}/5），不会重复上传文件`;
+        if(error.status!==404&&failures<5){setTimeout(tick,Math.min(10000,1500*failures));return;}
+        const button=document.createElement('button');button.textContent='重新查询';
+        button.onclick=()=>{button.remove();failures=0;tick();};el.querySelector('.actions').replaceChildren(button);
+      } finally {clearTimeout(timeout);}
+    }
+    tick();
+  }
+  function select(items){
+    if(items.length>1&&document.getElementById('document').value.trim()){alert('指定业务文档 ID 时请一次上传一个文件，避免互相覆盖。');return;}
+    Array.from(items).forEach(upload);
+  }
+  drop.onclick=()=>files.click();drop.onkeydown=e=>{if(e.key==='Enter'||e.key===' '){e.preventDefault();files.click();}};
+  files.onchange=()=>{select(files.files);files.value='';};
+  drop.ondragover=e=>{e.preventDefault();};drop.ondrop=e=>{e.preventDefault();select(e.dataTransfer.files);};
+  for(const item of saved){if(typeof item.id==='string'&&typeof item.name==='string')poll(item.id,card(item.name));}
+</script></body></html>

@@ -1023,9 +1023,17 @@ class MdToImgNode(BaseNode):
         摘要/上传计数是结果质量信息，不代表切片入库已成功；导入成功标志只由
         后面的 MilvusImportNode 在数据库核验通过后设置。
         """
+        # 【流程 07.3 · 图片处理】先保留原始 Markdown，再做图片摘要、上传与链接替换。
+        # 处理后的 md_content 交给 07.4 切片；raw_md_path/md_path 留给流程 08 归档。
         self.log_step("step_1", "读取 Markdown 内容并定位图片目录")
         md_content, md_path, image_dir = self._file_handler.read_md(state)
         # 扫描器统一识别 Markdown 图片，先转换正文中的 <img>，保留代码示例。
+        # 单独留存图片处理前的字节，输入文件名即使以 _new 结尾也不会丢失原文。
+        if state.get("source_archive"):
+            import shutil
+            raw_path = md_path.with_name(md_path.name + ".raw")
+            shutil.copyfile(md_path, raw_path)
+            state["raw_md_path"] = str(raw_path)
         md_content = normalize_html_images(md_content)
 
         self.log_step("step_2", "扫描有效图片并组装上下文")
@@ -1046,7 +1054,7 @@ class MdToImgNode(BaseNode):
 
         self.log_step("step_4", "上传图片并替换 Markdown 图片引用")
         new_md_content = self._image_uploader.upload_and_replace(
-            document_name=md_path.stem,
+            document_name=state.get("task_id") if state.get("source_archive") else md_path.stem,
             md_content=md_content,
             image_summaries=image_summaries,
             image_list=image_list,
