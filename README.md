@@ -65,3 +65,15 @@ $env:RUN_FULL_IMPORT_INTEGRATION='1'
 ```
 
 完整设计、实施记录与验收范围见 `docs/知识库导入全流程与切片向量化入库技术设计报告.md`。
+
+查询第一步“商品名确认”已提供独立节点与最小 LangGraph：DeepSeek 提取商品表述，
+BGE-M3 生成查询 dense/sparse，Milvus 使用 COSINE/IP 混合检索及等权 WeightedRanker。
+融合分数至少 0.7 且无歧义才自动确认；多商品问题全部确认后才发布查询范围。
+
+```powershell
+& '.\knowledge\.venv\Scripts\python.exe' -m knowledge.processor.query_processor 'RS PRO RS-12 数字万用表怎么测电阻？'
+& '.\knowledge\.venv\Scripts\python.exe' -m unittest knowledge.test.test_item_name_confirm -v
+```
+
+本阶段返回商品范围、候选澄清或错误状态，尚不执行正文检索和答案生成。
+配置、程序入口及真实服务验收见 `docs/商品名确认节点开发与联调说明.md`。
