@@ -23,6 +23,15 @@ class QueryGraphState(TypedDict, total=False):
     answer: str  # 澄清/无匹配/错误提示；不是产品知识答案，成功时为空
     error_code: str  # 正常业务结果为空；故障例如 milvus_unavailable
     warnings: list[str]  # 如 candidate_recall_truncated，不包含异常正文
+    retrieval_input: dict  # 准备步骤写入，三路只读
+    embedding_chunks: list[dict]  # 原问题真实切片，如 [{chunk_id:64位字符串, content:正文, route:vector, rank:1, score:0.6}]
+    hyde_embedding_chunks: list[dict]  # 与上面结构相同、route=hyde；不存放模型生成的假设文本
+    web_search_docs: list[dict]  # 网页证据，如 [{title:标题, url:链接, snippet:摘要, item_names:[A]}]
+    vector_search_meta: dict  # 原问题路诊断，如 {status:partial, items:[商品级状态], warnings:[], elapsed_seconds:1.2}
+    hyde_search_meta: dict  # HyDE路独占诊断字段；生成失败与无切片是不同状态
+    web_search_meta: dict  # 网络路独占诊断字段；关闭为skipped，缺配置为failed
+    retrieval_status: str  # join汇总：success/empty/partial/failed/skipped；有候选不等于生成了最终答案
+    retrieval_warnings: list[str]  # join合并去重的告警和错误码，例如 [mcp_auth_failed]，不含异常原文
 
 
 def empty_result() -> dict:

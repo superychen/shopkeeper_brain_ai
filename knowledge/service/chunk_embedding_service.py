@@ -78,6 +78,10 @@ class ChunkEmbeddingService:
                        "tokenizer": tokenizer.backend_tokenizer.to_str(),
                        "template": "item-newline-content:v1", "normalize": True})
 
+    def profile(self, client, tokenizer):
+        """查询复用入库指纹算法，不改变原入库入口及测试注入点。"""
+        return self._profile(client, tokenizer)
+
     def embed(self, texts):
         """输入 texts，返回 ([(dense, sparse), ...], profile)，保持位置一一对应。
 
